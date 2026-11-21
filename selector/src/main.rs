@@ -35,6 +35,8 @@ struct FileMap {
 #[derive(Default)]
 struct Map {
     ids: Vec<String>,
+    /// map test index -> (start, end) of its test method
+    mranges: HashMap<usize, (usize, usize)>,
     vcost: HashMap<usize, u64>,
     sets: Vec<Vec<u32>>,
     files: HashMap<String, FileMap>,
@@ -68,6 +70,10 @@ fn load_map(path: &Path) -> Map {
                 m.ids[n] = id.to_string();
             }
             "P" => m.procs = rest.parse().unwrap_or(0),
+            "M" => {
+                let v: Vec<usize> = rest.split(' ').map(|x| x.parse().unwrap()).collect();
+                m.mranges.insert(v[0], (v[1], v[2]));
+            }
             "V" => {
                 let (n, c) = rest.split_once(' ').unwrap();
                 m.vcost.insert(n.parse().unwrap(), c.parse().unwrap());
@@ -133,6 +139,8 @@ fn load_tests(path: &Path) -> Vec<Test> {
 /// What a commit needs.
 struct Plan {
     commit: String,
+    /// module- or class-level code changed: the module may no longer import
+    static_change: bool,
     /// (adapter, items, heavy test index, estimated ms)
     adapters: Vec<(String, Vec<String>, usize, u64)>,
     /// indices into tests vec
@@ -152,6 +160,60 @@ struct Ctx {
     map2t: Vec<Option<usize>>,
     by_file: HashMap<String, Vec<usize>>,
     id2t: HashMap<String, usize>,
+    /// tests vec index -> map test index
+    t2map: HashMap<usize, usize>,
+    texts: Mutex<HashMap<String, String>>,
+}
+
+/// `"KEY": value,` -> KEY (string-keyed dict entry, key of 3+ chars)
+fn dict_key(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    let q = t.chars().next()?;
+    if q != '"' && q != '\'' {
+        return None;
+    }
+    let rest = &t[1..];
+    let end = rest.find(q)?;
+    let key = &rest[..end];
+    let after = rest[end + 1..].trim_start();
+    if !after.starts_with(':') || key.chars().count() < 3 || key.contains('\\') {
+        return None;
+    }
+    // only SQL-text keys (keywords, function names); lowercase keys are argument names
+    if key.chars().any(|c| c.is_lowercase()) || !key.chars().any(|c| c.is_alphabetic()) {
+        return None;
+    }
+    Some(key.to_string())
+}
+
+/// Every changed line in this statement must be a string-keyed entry.
+fn keyed_ok(t: &patch::Touch, x: (u32, u32, u32)) -> bool {
+    let removed_ok = t.removed.iter().zip(&t.removed_text).all(|(&l, txt)| {
+        let l = l as u32;
+        !(x.0 <= l && l <= x.1) || dict_key(txt).is_some() || txt.trim().is_empty()
+    });
+    let inserted_ok = t.inserted.iter().all(|(a, lines, _)| {
+        let a = *a as u32;
+        !(x.0 <= a && a <= x.1) || lines.iter().all(|l| dict_key(l).is_some() || l.trim().is_empty())
+    });
+    removed_ok && inserted_ok
+}
+
+fn norm(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut sp = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !sp {
+                out.push(' ');
+            }
+            sp = true;
+        } else {
+            out.extend(c.to_lowercase());
+            sp = false;
+        }
+    }
+    out
 }
 
 const ADAPTERS: &[(&str, &str)] = &[
@@ -198,6 +260,76 @@ impl Ctx {
         }
     }
 
+    /// Does test i's own source, or a data file it reads, contain any of the keys?
+    fn mentions(&self, i: usize, keys: &[String]) -> bool {
+        let n = self.tests.len();
+        if i >= n {
+            return true; // adapter items decide for themselves
+        }
+        let norm_keys: Vec<String> = keys.iter().map(|k| norm(k)).collect();
+        let hit = |text: &str| {
+            let t = norm(text);
+            norm_keys.iter().any(|k| t.contains(k.as_str()))
+        };
+        let test = &self.tests[i];
+        let src = self.text(&test.file);
+        let mt = self.t2map.get(&i).copied();
+        match mt.and_then(|m| self.map.mranges.get(&m).copied()) {
+            Some((a, b)) => {
+                let body: Vec<&str> = src.lines().skip(a - 1).take(b + 1 - a).collect();
+                if hit(&body.join("\n")) {
+                    return true;
+                }
+                // text outside any test method (module constants, helpers) counts for the whole file
+                if hit(&self.outside_tests(&test.file)) {
+                    return true;
+                }
+            }
+            None => return true,
+        }
+        if let Some(m) = mt {
+            for f in self.data_files_of(m) {
+                if hit(&self.text(&f)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn text(&self, rel: &str) -> String {
+        let mut c = self.texts.lock().unwrap();
+        c.entry(rel.to_string()).or_insert_with(|| fs::read_to_string(self.src_root.join(rel)).unwrap_or_default()).clone()
+    }
+
+    fn outside_tests(&self, file: &str) -> String {
+        let src = self.text(file);
+        let mut inside = vec![false; src.lines().count() + 2];
+        for (&m, &(a, b)) in &self.map.mranges {
+            if self.map.ids.get(m).map_or(false, |id| id.starts_with(&format!("{file}::"))) {
+                for l in a..=b.min(inside.len() - 1) {
+                    inside[l] = true;
+                }
+            }
+        }
+        src.lines().enumerate().filter(|(k, _)| !inside[k + 1]).map(|(_, l)| l).collect::<Vec<_>>().join("\n")
+    }
+
+    fn data_files_of(&self, m: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for (f, fm) in &self.map.files {
+            if f.ends_with(".py") || f.starts_with("dir:") {
+                continue;
+            }
+            if let Some(d) = fm.dep {
+                if self.map.sets.get(d as usize).map_or(false, |s| s.binary_search(&(m as u32)).is_ok()) {
+                    out.push(f.clone());
+                }
+            }
+        }
+        out
+    }
+
     fn file_overhead(file: &str) -> u64 {
         match file {
             "tests/test_executor.py" => 3200,
@@ -211,6 +343,8 @@ impl Ctx {
         let n = self.tests.len();
         let heavy_ms: u64 = std::env::var("BR_HEAVY_MS").ok().and_then(|x| x.parse().ok()).unwrap_or(1500);
         let crun: f64 = std::env::var("BR_C").ok().and_then(|x| x.parse().ok()).unwrap_or(1.0);
+        // CPU seconds on the scoring machine per CPU second measured where the costs were estimated
+        let cpux: f64 = std::env::var("BR_CPUX").ok().and_then(|x| x.parse().ok()).unwrap_or(4.0);
         let vhits: BTreeSet<usize> = p.run.iter().filter(|&&i| i >= n).map(|&i| i - n).collect();
         let mut real: BTreeSet<usize> = p.run.iter().copied().filter(|&i| i < n).collect();
         let mut forced: BTreeSet<usize> = BTreeSet::new();
@@ -241,6 +375,15 @@ impl Ctx {
             }
             let data_change = p.changed.iter().any(|(f, _)| !f.ends_with(".py"));
             let mut exhaustive = false;
+            let tpc_fixture = p.changed.iter().all(|(f, c)| {
+                !f.ends_with(".py") && c.is_some() && (f.ends_with("tpc-ds/tpc-ds.sql") || f.ends_with("tpc-h/tpc-h.sql"))
+            });
+            if data_change && hits.is_empty() && !base_hit && tpc_fixture && (name.starts_with("exec") || *name == "opt_tpch") && *name != "opt_tpch" {
+                // only the edited queries can change: the adapter finds them itself
+                log!("{}: adapter {} on edited fixture entries", p.commit, name);
+                p.adapters.push((name.to_string(), vec!["AUTO".into()], t, 2500));
+                continue;
+            }
             if data_change && hits.is_empty() && !base_hit {
                 // a data file the test reads changed: every item is suspect
                 for (v, id) in self.map.ids.iter().enumerate() {
@@ -254,7 +397,7 @@ impl Ctx {
             }
             let setup: u64 = if name.starts_with("exec") || name.starts_with("opt") { 1500 } else { 200 };
             let full: u64 = hits.iter().map(|h| h.0).sum();
-            let limit = 0.6 * (d + 2000) as f64;
+            let limit = 0.6 * (d + 2000) as f64 / cpux;
             if base_hit {
                 log!("{}: include {} (setup reached)", p.commit, name);
                 forced.insert(t);
@@ -304,7 +447,7 @@ impl Ctx {
                 files.insert(self.tests[i].file.as_str());
             }
             let overhead: u64 = 450 + files.iter().map(|f| Self::file_overhead(f)).sum::<u64>();
-            let run_cost = (sum as f64 * crun) as u64 + overhead;
+            let run_cost = ((sum as f64 * crun + overhead as f64) * cpux) as u64;
             let base = pack_cost(&self.tests, &forced);
             let mut all = forced.clone();
             all.extend(real.iter().copied());
@@ -329,7 +472,7 @@ impl Ctx {
 
     fn plan(&self, commit: &str, text: &str) -> Plan {
         let fps = patch::parse(text);
-        let mut p = Plan { commit: commit.to_string(), adapters: Vec::new(), run: BTreeSet::new(), force: BTreeSet::new(), changed: vec![], ok: true };
+        let mut p = Plan { commit: commit.to_string(), static_change: false, adapters: Vec::new(), run: BTreeSet::new(), force: BTreeSet::new(), changed: vec![], ok: true };
         let mut seen_paths: HashSet<String> = HashSet::new();
         for fp in &fps {
             let oldp = fp.old_path.clone();
@@ -440,6 +583,8 @@ impl Ctx {
         let t = patch::touches(&fp.hunks);
         let mut coarse = false;
         let mut sets: BTreeSet<u32> = BTreeSet::new();
+        // statement set -> dict keys whose entries changed (string-keyed entries only)
+        let mut keyed: HashMap<u32, Vec<String>> = HashMap::new();
         fn innermost(v: &[(u32, u32, u32)], l: u32) -> Option<(u32, u32, u32)> {
             let mut best: Option<(u32, u32, u32)> = None;
             for &u in v {
@@ -462,20 +607,32 @@ impl Ctx {
                 continue;
             }
             let l = l as u32;
-            docs_hit(l, &mut sets);
+            if fm.docs.iter().any(|d| d.0 <= l && l <= d.1) {
+                // a docstring is never executed: only doctests can see it
+                docs_hit(l, &mut sets);
+                continue;
+            }
             if let Some(&s) = fm.lines.get(&l) {
                 sets.insert(s);
             }
             if let Some(u) = innermost(&fm.units, l) {
                 sets.insert(u.2);
             } else if let Some(x) = innermost(&fm.stmts, l) {
-                sets.insert(x.2);
+                p.static_change = true;
+                match dict_key(&t.removed_text[t.removed.iter().position(|&r| r as u32 == l).unwrap()]) {
+                    Some(k) if keyed_ok(&t, x) && std::env::var("BR_NOKEY").is_err() => {
+                        keyed.entry(x.2).or_default().push(k);
+                    }
+                    _ => {
+                        sets.insert(x.2);
+                    }
+                }
             } else {
                 log!("{}: {path}:{l}: unmapped static line -> module dependents", p.commit);
                 coarse = true;
             }
         }
-        for (a, newlines) in &t.inserted {
+        for (a, newlines, replaces) in &t.inserted {
             let ninfo = pyline::analyze(&newlines.join("\n"));
             let code: Vec<&pyline::LineInfo> = ninfo.iter().filter(|x| x.has_code).collect();
             if code.is_empty() {
@@ -500,10 +657,16 @@ impl Ctx {
                 sets.insert(u.2);
                 continue;
             }
-            // 2. inside a (multi-line) static statement
-            let stmt = fm.stmts.iter().copied().filter(|x| x.0 <= a && a + 1 <= x.1).min_by_key(|x| x.1 - x.0);
+            p.static_change = true;
+            // 2. inside a (multi-line) static statement (or extending the one it replaces)
+            let stmt = fm
+                .stmts
+                .iter()
+                .copied()
+                .filter(|x| x.0 <= a && (a + 1 <= x.1 || (*replaces && a <= x.1)))
+                .min_by_key(|x| x.1 - x.0);
             if let Some(x) = stmt {
-                if ind > indent_of(x.0) {
+                if ind > indent_of(x.0) || (*replaces && ind >= indent_of(x.0)) {
                     sets.insert(x.2);
                     continue;
                 }
@@ -537,10 +700,31 @@ impl Ctx {
             log!("{}: {path}: new module-level code after line {a} -> module dependents", p.commit);
             coarse = true;
         }
+        // inserted lines of a keyed replacement add their keys too
+        for nl in &t.added_text {
+            if let Some(k) = dict_key(nl) {
+                for v in keyed.values_mut() {
+                    if !v.contains(&k) {
+                        v.push(k.clone());
+                    }
+                }
+            }
+        }
+        for (sid, keys) in &keyed {
+            if sets.contains(sid) {
+                continue;
+            }
+            let mut all = BTreeSet::new();
+            self.add_set(&mut all, *sid);
+            let kept: BTreeSet<usize> = all.into_iter().filter(|&i| self.mentions(i, keys)).collect();
+            log!("{}: {path}: keyed entries {:?} -> {} tests", p.commit, keys, kept.len());
+            p.run.extend(kept);
+        }
         for s in sets {
             self.add_set(&mut p.run, s);
         }
         if coarse {
+            p.static_change = true;
             if let Some(d) = fm.dep {
                 self.add_set(&mut p.run, d);
             }
@@ -738,7 +922,8 @@ fn main() {
     }
     let id2t_owned: HashMap<String, usize> = id2t.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     drop(id2t);
-    let ctx = Ctx { src_root: src_root.clone(), tests, map, map2t, by_file, id2t: id2t_owned };
+    let t2map: HashMap<usize, usize> = map2t.iter().enumerate().filter_map(|(m, t)| t.map(|t| (t, m))).collect();
+    let ctx = Ctx { src_root: src_root.clone(), tests, map, map2t, by_file, id2t: id2t_owned, t2map, texts: Mutex::new(HashMap::new()) };
 
     let mut commits: Vec<(String, PathBuf)> = Vec::new();
     if let Ok(rd) = fs::read_dir(data.join("commits")) {
@@ -766,7 +951,7 @@ fn main() {
             Ok(p) => p,
             Err(_) => {
                 log!("{c}: planning panicked: including every test");
-                Plan { commit: c.clone(), adapters: vec![], run: BTreeSet::new(), force: (0..ctx.tests.len()).collect(), changed: vec![], ok: true }
+                Plan { commit: c.clone(), static_change: true, adapters: vec![], run: BTreeSet::new(), force: (0..ctx.tests.len()).collect(), changed: vec![], ok: true }
             }
         };
         // unmapped tests: always include when anything python changed (we know nothing about them)
@@ -819,6 +1004,12 @@ fn main() {
                     jobs[first].est += est;
                 } else {
                     jobs.push(Job { plan: pi, tests: vec![], est, probes, adapts });
+                }
+            }
+            // nothing to run and only function bodies changed: a syntax check is enough
+            if jobs.len() == first + 1 && jobs[first].tests.is_empty() && jobs[first].adapts.is_empty() && !pl.static_change {
+                for pr in jobs[first].probes.iter_mut() {
+                    pr.0 = format!("COMPILE:{}", pr.0);
                 }
             }
         }

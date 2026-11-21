@@ -120,6 +120,19 @@ def idents(node):
     return s
 
 
+def load_idents(node):
+    """Identifiers read (not assigned) anywhere in node."""
+    s = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Store):
+            s.add(n.id)
+        elif isinstance(n, ast.Attribute) and not isinstance(n.ctx, ast.Store):
+            s.add(n.attr)
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier() and len(n.value) > 2:
+            s.add(n.value)
+    return s
+
+
 def attr_chains(node):
     """(attr, owner-last-ident, owner-prev-ident) for every Attribute."""
     out = []
@@ -186,7 +199,7 @@ def walk_body(path, body, qual, cls):
                 for i in idents(st):
                     ident_modstmts[i].append(len(module_stmts) - 1)
             else:
-                for i in idents(st):
+                for i in load_idents(st):
                     class_stmt_refs[i].add(cls)
                 for a, last, prev in attr_chains(st):
                     class_chain_refs.append((cls, a, last, prev, bound_names(st) | mutated_roots(st)))
@@ -288,7 +301,11 @@ def chain_refs(cn, attrs, depth=0, seen=None):
         for k in chain_func.get((a, simple), ()):
             out |= unit_tests(k)
         for d, bnames in set(class_chain_idx.get((a, simple), ())):
-            out |= class_users(d)
+            du = class_users(d)
+            rd = readers(set(bnames) or {a})
+            if rd is not None:
+                du &= rd
+            out |= du
             out |= chain_refs(d, set(bnames) or {a}, depth + 1, seen)
     return out
 
@@ -336,6 +353,9 @@ def readers(names):
     for n in names:
         for k in ident_funcs.get(n, []):
             if func_static(k):
+                if os.environ.get("DEBUG_READERS") and n in os.environ["DEBUG_READERS"].split(","):
+                    fu = func_units[k]
+                    print("readers: static func", n, fu[0], fu[3], fu[4], getattr(fu[1], "name", "lambda"), file=sys.stderr)
                 _rd[key] = None
                 return None
         for pl in ident_lines.get(n, ()):
@@ -349,8 +369,8 @@ def readers(names):
 _nc = {}
 
 
-def name_closure(names, depth=0, seen=None):
-    key = tuple(sorted(names))
+def name_closure(names, depth=0, seen=None, funcs_at_top=True):
+    key = (tuple(sorted(names)), funcs_at_top)
     if depth == 0 and key in _nc:
         return _nc[key]
     if seen is None:
@@ -362,12 +382,19 @@ def name_closure(names, depth=0, seen=None):
     seen |= todo
     nxt = set()
     for n in todo:
-        for k in ident_funcs.get(n, []):
-            out |= unit_tests(k)
+        if funcs_at_top or depth > 0:
+            for k in ident_funcs.get(n, []):
+                out |= unit_tests(k)
         for cn in class_stmt_refs.get(n, set()):
             out |= class_users(cn)
         for si in ident_modstmts.get(n, []):
             path, st = module_stmts[si]
+            if isinstance(st, (ast.Import, ast.ImportFrom)):
+                # an import rebinds the same object; only an alias is a new name
+                for al in st.names:
+                    if al.name.split(".")[-1] == n and al.asname and al.asname != n:
+                        nxt.add(al.asname)
+                continue
             b = bound_names(st)
             if n in b and len(b) == 1:
                 continue
@@ -432,7 +459,8 @@ for (path, s, e), k in sorted(seen_units.items()):
         body_lines = range(node.body[0].lineno if node.body else node.lineno, e + 1)
         if any((path, l) in static_exec for l in body_lines):
             if cls is None:
-                st |= name_closure({node.name})
+                # runtime callers are covered by their own lines; what matters is what import built
+                st |= name_closure({node.name}, funcs_at_top=False)
             else:
                 st |= class_users(cls)
     file_sections[path].append(f"U {s} {e} {sid(st)}")
@@ -487,6 +515,24 @@ for path, tree in trees.items():
 
 for p, s in sorted(open_tests.items()):
     file_sections[p].append(f"D {sid(s)}")
+
+# test method source ranges (for key-text matching)
+for t in tests[:real_n]:
+    parts = t["id"].split("::")
+    tree = trees.get(t["file"])
+    if tree is None or len(parts) < 2:
+        continue
+    found = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and len(parts) >= 3 and node.name == parts[1]:
+            for f in node.body:
+                if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name == parts[2]:
+                    found = f
+        elif len(parts) == 2 and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == parts[1]:
+            found = node
+    if found is not None:
+        start = min([found.lineno] + [d.lineno for d in found.decorator_list])
+        out_lines.append(f"M {t['number']} {start} {found.end_lineno}")
 
 for i, s in enumerate(set_list):
     out_lines.append(f"S {i} " + " ".join(map(str, s)))

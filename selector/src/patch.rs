@@ -221,43 +221,61 @@ pub fn apply(old: &str, hunks: &[Hunk]) -> Result<String, String> {
 /// An insertion point `a` means new lines were inserted after old line `a` (0 = top).
 pub struct Touch {
     pub removed: Vec<usize>,
-    pub inserted: Vec<(usize, Vec<String>)>,
+    /// (insert after old line a, lines, replaces: a is the last line of a removed run)
+    pub inserted: Vec<(usize, Vec<String>, bool)>,
     pub removed_text: Vec<String>,
+    pub added_text: Vec<String>,
 }
 
 pub fn touches(hunks: &[Hunk]) -> Touch {
-    let mut t = Touch { removed: vec![], inserted: vec![], removed_text: vec![] };
+    let mut t = Touch { removed: vec![], inserted: vec![], removed_text: vec![], added_text: vec![] };
     for h in hunks {
-        let mut o = if h.old_len == 0 { h.old_start } else { h.old_start.saturating_sub(1) }; // lines consumed so far
+        let mut o = if h.old_len == 0 { h.old_start } else { h.old_start.saturating_sub(1) };
+        let mut minus_run = 0usize; // removed lines right before the current + run
         let mut pending: Vec<String> = Vec::new();
         let mut pending_at = o;
+        let mut pending_minus = 0usize;
+        let flush = |t: &mut Touch, pending: &mut Vec<String>, at: usize, minus: usize| {
+            if pending.is_empty() {
+                return;
+            }
+            if minus == 0 {
+                t.inserted.push((at, std::mem::take(pending), false));
+            } else if pending.len() > minus {
+                // a replacement that also adds lines: attribute it to the replaced statement
+                t.inserted.push((at, std::mem::take(pending), true));
+            } else {
+                pending.clear();
+            }
+        };
         for (k, s) in &h.lines {
             match *k {
                 b' ' => {
-                    if !pending.is_empty() {
-                        t.inserted.push((pending_at, std::mem::take(&mut pending)));
-                    }
+                    flush(&mut t, &mut pending, pending_at, pending_minus);
+                    minus_run = 0;
                     o += 1;
                 }
                 b'-' => {
                     if !pending.is_empty() {
-                        t.inserted.push((pending_at, std::mem::take(&mut pending)));
+                        flush(&mut t, &mut pending, pending_at, pending_minus);
+                        minus_run = 0;
                     }
                     o += 1;
+                    minus_run += 1;
                     t.removed.push(o);
                     t.removed_text.push(s.clone());
                 }
                 _ => {
+                    t.added_text.push(s.clone());
                     if pending.is_empty() {
                         pending_at = o;
+                        pending_minus = minus_run;
                     }
                     pending.push(s.clone());
                 }
             }
         }
-        if !pending.is_empty() {
-            t.inserted.push((pending_at, pending));
-        }
+        flush(&mut t, &mut pending, pending_at, pending_minus);
     }
     t
 }

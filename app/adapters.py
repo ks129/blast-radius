@@ -95,6 +95,25 @@ def items(name):
     return []
 
 
+def auto_items(name):
+    """Items whose fixture entry differs from the pinned tree (for fixture edits)."""
+    import os
+
+    import tests.helpers as h
+
+    m, inst = _executor()
+    fname = "optimizer/tpc-ds/tpc-ds.sql" if name == "exec_tpcds" else "optimizer/tpc-h/tpc-h.sql"
+    new = inst.tpcds_sqls if name == "exec_tpcds" else inst.tpch_sqls
+    src = os.environ.get("BR_SRC_DIR")
+    old_dir = h.FIXTURES_DIR
+    try:
+        h.FIXTURES_DIR = os.path.join(src, "tests", "fixtures")
+        old = list(h.load_sql_fixture_pairs(fname))
+    finally:
+        h.FIXTURES_DIR = old_dir
+    return [str(i) for i, entry in enumerate(new) if i >= len(old) or tuple(entry) != tuple(old[i])]
+
+
 def setup(name):
     if name in ("exec_tpcds", "exec_tpch", "opt_tpch"):
         _executor()

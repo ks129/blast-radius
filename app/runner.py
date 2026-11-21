@@ -99,6 +99,8 @@ def run_adapters(adapts, wfd):
         ok = True
         try:
             adapters.setup(name)
+            if its == ["AUTO"]:
+                its = adapters.auto_items(name)
             for it in its:
                 adapters.run_item(name, it)
         except BaseException as e:
@@ -111,6 +113,7 @@ def run_adapters(adapts, wfd):
 
 
 SRC = os.path.realpath(os.getcwd())
+os.environ["BR_SRC_DIR"] = SRC
 
 
 def _ours(m):
@@ -324,6 +327,20 @@ def main():
             m, _, i = l2.partition(" ")
             items.append((float(m), i))
         t0 = time.monotonic()
+        if probes and not items and not adapts and all(m.startswith("COMPILE:") for m, _ in probes):
+            # syntax check only, in this process: no fork, no import
+            ifail = []
+            for _, rel in probes:
+                try:
+                    with open(os.path.join(root, rel), encoding="utf-8") as fh:
+                        compile(fh.read(), rel, "exec")
+                except BaseException:
+                    ifail.append(rel)
+            out = ["RES " + jobid] + ["I " + x for x in ifail] + ["END"]
+            OUT.write("\n".join(out) + "\n")
+            OUT.flush()
+            continue
+        probes = [(m[len("COMPILE:"):] if m.startswith("COMPILE:") else m, r) for m, r in probes]
         fail, passed, unknown, ifail, ares = handle(jobid, root, float(base), items, pre, probes, adapts)
         out = ["RES " + jobid]
         out += ["F " + x for x in sorted(fail)]
