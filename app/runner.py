@@ -24,10 +24,11 @@ import unittest  # noqa: E402,F401
 import sqlite3  # noqa: E402,F401
 import multiprocessing  # noqa: E402,F401
 import concurrent.futures  # noqa: E402,F401
-import pytest  # noqa: E402
-import _pytest.unittest  # noqa: E402,F401
-import _pytest.python  # noqa: E402,F401
-import _pytest.subtests  # noqa: E402,F401
+if os.environ.get("BR_RUNNER") == "pytest":
+    import pytest  # noqa: E402
+    import _pytest.unittest  # noqa: E402,F401
+    import _pytest.python  # noqa: E402,F401
+    import _pytest.subtests  # noqa: E402,F401
 
 # pandas/numpy/duckdb cost ~0.35 s to import: only preload them when some job needs them
 if os.environ.get("BR_HEAVY_PRELOAD", "1") == "1":
@@ -86,24 +87,7 @@ class Reporter:
         self._send("E", nodeid)
 
     def pytest_collection_modifyitems(self, session, config, items):
-        # TestExecutor.setUpClass parses every TPC CSV up front (1.4 s); the adapters build the
-        # same class state with tables parsed on first use. Only when that test file and its
-        # helpers are the pinned ones (symlinks in the farm).
-        m = sys.modules.get("tests.test_executor")
-        if m is None:
-            return
-        root = os.getcwd()
-        if not all(os.path.realpath(os.path.join(root, p)).startswith(SRC + os.sep) for p in ("tests/test_executor.py", "tests/helpers.py")):
-            return
-        try:
-            import adapters
-
-            def lazy_setup(cls):
-                adapters._executor()
-
-            m.TestExecutor.setUpClass = classmethod(lazy_setup)
-        except Exception:
-            pass
+        patch_executor()
 
 
 def probe(root, probes, wfd):
@@ -225,13 +209,122 @@ def child(root, ids, wfd, pre, probes=(), adapts=()):
             run_adapters(adapts, wfd)
         if not ids:
             os._exit(0)
-        args = ["-q", "-p", "no:cacheprovider", "-p", "no:randomly", "--rootdir", root, "-o", "addopts=",
-                "--tb=no", "--assert=plain"] + list(ids)
-        pytest.main(args, plugins=[Reporter(wfd, ids)])
+        if os.environ.get("BR_RUNNER") == "pytest":
+            args = ["-q", "-p", "no:cacheprovider", "-p", "no:randomly", "--rootdir", root, "-o", "addopts=",
+                    "--tb=no", "--assert=plain"] + list(ids)
+            pytest.main(args, plugins=[Reporter(wfd, ids)])
+        else:
+            run_unittest(ids, wfd)
     except BaseException:
-        pass
+        if os.environ.get("BR_DEBUG"):
+            import traceback
+            with open("/tmp/child_err.txt", "a") as fh:
+                fh.write(traceback.format_exc() + "\n")
     finally:
         os._exit(0)
+
+
+def patch_executor():
+    """Lazy TestExecutor class set-up (tables and views on first use), only for pinned test files."""
+    m = sys.modules.get("tests.test_executor")
+    if m is None or getattr(m, "_br_lazy", False):
+        return
+    root = os.getcwd()
+    if not all(os.path.realpath(os.path.join(root, p)).startswith(SRC + os.sep) for p in ("tests/test_executor.py", "tests/helpers.py")):
+        return
+    try:
+        import adapters
+
+        def lazy_setup(cls):
+            adapters._executor()
+
+        m.TestExecutor.setUpClass = classmethod(lazy_setup)
+        m._br_lazy = True
+    except Exception:
+        pass
+
+
+def run_unittest(ids, wfd):
+    """Run unittest node ids directly (the suite has no pytest-only tests); same verdicts as
+    pytest: failures, errors, failed subtests and unexpected successes fail the test."""
+    import importlib
+    import unittest
+
+    def send(kind, nodeid):
+        os.write(wfd, (kind + " " + nodeid + "\n").encode())
+
+    groups, order = {}, []
+    for nid in ids:
+        parts = nid.split("::")
+        key = (parts[0], parts[1] if len(parts) > 2 else "")
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append((parts[-1], nid))
+    tests, idmap = [], {}
+    for f, cls in order:
+        try:
+            mod = importlib.import_module(f[:-3].replace("/", "."))
+            klass = getattr(mod, cls)
+        except BaseException:
+            send("C", f)
+            continue
+        patch_executor()
+        for meth, nid in groups[(f, cls)]:
+            try:
+                t = klass(meth)
+            except BaseException:
+                send("F", nid)
+                continue
+            tests.append(t)
+            idmap[id(t)] = nid
+
+    class Result(unittest.TestResult):
+        def startTest(self, test):
+            super().startTest(test)
+            n = idmap.get(id(test))
+            if n:
+                send("S", n)
+
+        def stopTest(self, test):
+            super().stopTest(test)
+            n = idmap.get(id(test))
+            if n:
+                send("E", n)
+
+        def _fail(self, test):
+            n = idmap.get(id(test))
+            if n:
+                send("F", n)
+                return
+            # a class or module fixture failed: every test of that class fails
+            desc = str(test)
+            for t in tests:
+                if f".{t.__class__.__name__})" in desc or f" ({t.__class__.__module__})" in desc:
+                    send("F", idmap[id(t)])
+
+        def _log(self, test, err):
+            if os.environ.get("BR_DEBUG"):
+                import traceback
+                with open("/tmp/ut_err.txt", "a") as fh:
+                    fh.write(str(test) + "\n" + "".join(traceback.format_exception(*err))[-1500:] + "\n")
+
+        def addError(self, test, err):
+            self._log(test, err)
+            self._fail(test)
+
+        def addFailure(self, test, err):
+            self._log(test, err)
+            self._fail(test)
+
+        def addSubTest(self, test, subtest, err):
+            if err is not None:
+                self._fail(test)
+
+        def addUnexpectedSuccess(self, test):
+            self._fail(test)
+
+    unittest.TestSuite(tests).run(Result())
 
 
 def run_batch(root, ids, timeout, pre, probes=(), adapts=(), idle=30.0, stopfail=False):
@@ -296,13 +389,16 @@ def run_batch(root, ids, timeout, pre, probes=(), adapts=(), idle=30.0, stopfail
     return failed, finished, collect_fail, culprit, import_fail, adapt_res
 
 
+_TBASE = float(os.environ.get("BR_TEST_TIMEOUT", "6"))
+
+
 def handle(jobid, root, base, items, pre, probes, adapts=(), stopfail=False):
     tmult = dict((i, m) for m, i in items)
     ids = [i for _, i in items]
 
     def timeout(nodeid):
         # a test far past its recorded time counts as failing (a hang costs little this way)
-        return 6.0 + 5.0 * tmult.get(nodeid, 0.0)
+        return _TBASE + 5.0 * tmult.get(nodeid, 0.0)
 
     todo = list(ids)
     fail, passed, unknown = set(), set(), set()

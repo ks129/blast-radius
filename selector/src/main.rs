@@ -474,6 +474,26 @@ impl Ctx {
         idx.as_ref().unwrap().get(&(m as u32)).cloned().unwrap_or_default()
     }
 
+    /// Cheap pre-check before asking the AST checker: whitespace-only difference, or every
+    /// changed line inside a function signature (where annotations live).
+    fn maybe_inert(&self, path: &str, fp: &patch::FilePatch) -> bool {
+        let t = patch::touches(&fp.hunks);
+        let squash = |v: &[String]| v.iter().flat_map(|l| l.chars().filter(|c| !c.is_whitespace())).collect::<String>();
+        if squash(&t.removed_text) == squash(&t.added_text) {
+            return true;
+        }
+        let Some(fm) = self.map.files.get(path) else { return false };
+        let in_signature = |l: u32| {
+            fm.units.iter().any(|u| {
+                let body = fm.hdrs.iter().filter(|h| u.0 <= h.0 && h.1 <= u.1).map(|h| h.0).min().unwrap_or(u.1 + 1);
+                u.0 <= l && l < body
+            })
+        };
+        !t.removed.is_empty()
+            && t.removed.iter().all(|&l| in_signature(l as u32))
+            && t.inserted.iter().all(|(a, _, rep)| *rep && in_signature(*a as u32))
+    }
+
     fn ast_verdict(&self, old: &Path, new_text: &str) -> Option<String> {
         if std::env::var("BR_NOAST").is_ok() {
             return None;
@@ -650,10 +670,10 @@ impl Ctx {
                 files.insert(self.tests[i].file.as_str());
             }
             let nt = real.len();
-            let overhead: u64 = 250 + files.iter().map(|f| Self::file_overhead(f)).sum::<u64>();
+            let overhead: u64 = 130 + files.iter().map(|f| Self::file_overhead(f)).sum::<u64>();
             // prior that every candidate passes (surviving mutants are common on small sets)
             let p0: f64 = if nt <= 3 { 0.55 } else if nt <= 10 { 0.5 } else if nt <= 30 { 0.4 } else { 0.3 };
-            let run_cost = ((sum as f64 * 1.2 * crun + overhead as f64 + (1.0 - p0) * 450.0) * cpux) as u64;
+            let run_cost = ((sum as f64 * 1.05 * crun + overhead as f64 + (1.0 - p0) * 300.0) * cpux) as u64;
             let base = pack_cost(&self.tests, &forced);
             let mut all = forced.clone();
             all.extend(real.iter().copied());
@@ -722,7 +742,7 @@ impl Ctx {
             self.select_file(&mut p, &path, old_text.as_deref(), if newp.is_some() { new_text.as_deref() } else { None }, fp, oldp.is_none(), newp.is_none() || oldp != newp);
             let mut got = std::mem::replace(&mut p.run, before);
             // a large selection for an edit that might be inert: ask the AST checker
-            if path.ends_with(".py") && got.len() > 20 && oldp.is_some() && oldp == newp {
+            if path.ends_with(".py") && got.len() > 20 && oldp.is_some() && oldp == newp && self.maybe_inert(&path, fp) {
                 if let (Some(o), Some(nt)) = (&oldp, &new_text) {
                     if let Some(verdict) = self.ast_verdict(&self.src_root.join(o), nt) {
                         if verdict != "DIFF" {
