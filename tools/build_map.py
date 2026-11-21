@@ -11,6 +11,7 @@ from collections import defaultdict
 
 root, tests_json, cov_dir, intro_json, out = sys.argv[1:6]
 extra = sys.argv[6] if len(sys.argv) > 6 else None
+cmp_sites = json.load(open(sys.argv[7])) if len(sys.argv) > 7 else None
 tests = json.load(open(tests_json))["tests"]
 real_n = len(tests)
 virtual = []
@@ -546,6 +547,19 @@ for path, tree in trees.items():
     file_sections[path].append(f"D {sid(mod_tests.get(modname(path), 0))}")
     if path in src_read:
         file_sections[path].append(f"R {sid(src_read[path])}")
+
+# comparison lines where `is` and `==` never disagreed on any recorded evaluation
+if cmp_sites:
+    bad_lines = set()
+    seen_lines = set()
+    for site in cmp_sites["bad"]:
+        f, l, _ = site.rsplit(":", 2)
+        bad_lines.add((f, int(l)))
+    for site in cmp_sites["seen"]:
+        f, l, _ = site.rsplit(":", 2)
+        seen_lines.add((f, int(l)))
+    for f, l in sorted(seen_lines - bad_lines):
+        file_sections[f].append(f"Q {l}")
 
 for p, s in sorted(open_tests.items()):
     file_sections[p].append(f"D {sid(s)}")

@@ -23,6 +23,8 @@ struct Test {
 
 #[derive(Default)]
 struct FileMap {
+    /// lines whose `is`/`==` comparisons always agreed when the suite ran at the pinned commit
+    eqsafe: HashSet<u32>,
     units: Vec<(u32, u32, u32)>,
     /// statement headers inside function bodies
     hdrs: Vec<(u32, u32, u32)>,
@@ -96,6 +98,9 @@ fn load_map(path: &Path) -> Map {
             "U" => {
                 let v: Vec<u32> = rest.split(' ').map(|x| x.parse().unwrap()).collect();
                 m.files.get_mut(cur.as_ref().unwrap()).unwrap().units.push((v[0], v[1], v[2]));
+            }
+            "Q" => {
+                m.files.get_mut(cur.as_ref().unwrap()).unwrap().eqsafe.insert(rest.parse().unwrap());
             }
             "H" => {
                 let v: Vec<u32> = rest.split(' ').map(|x| x.parse().unwrap()).collect();
@@ -310,6 +315,32 @@ fn stmt_guard(t: &patch::Touch, info: &[pyline::LineInfo]) -> bool {
         }
     }
     true
+}
+
+/// Every change is one `is`<->`==` (or `is not`<->`!=`) swap on a line whose comparisons
+/// always agreed at the pinned commit, outside string literals, with nothing else touched.
+fn identity_swap_only(t: &patch::Touch, eqsafe: &HashSet<u32>) -> bool {
+    if t.removed.is_empty() || t.removed.len() != t.added_text.len() {
+        return false;
+    }
+    if t.inserted.iter().any(|(_, lines, rep)| !rep && lines.iter().any(|l| !l.trim().is_empty())) {
+        return false;
+    }
+    const SWAPS: &[(&str, &str)] = &[(" is not ", " != "), (" != ", " is not "), (" is ", " == "), (" == ", " is ")];
+    t.removed.iter().zip(&t.removed_text).zip(&t.added_text).all(|((&l, old), new)| {
+        if !eqsafe.contains(&(l as u32)) {
+            return false;
+        }
+        SWAPS.iter().any(|(a, b)| {
+            let n = old.matches(a).count();
+            if n != 1 || (*a == " is " && old.contains(" is not ")) {
+                return false;
+            }
+            let at = old.find(a).unwrap();
+            let quotes = old[..at].chars().filter(|&c| c == '"' || c == '\'').count();
+            quotes % 2 == 0 && old.replacen(a, b, 1) == *new
+        })
+    })
 }
 
 fn norm(s: &str) -> String {
@@ -539,7 +570,7 @@ impl Ctx {
         let heavy_ms: u64 = std::env::var("BR_HEAVY_MS").ok().and_then(|x| x.parse().ok()).unwrap_or(1500);
         let crun: f64 = std::env::var("BR_C").ok().and_then(|x| x.parse().ok()).unwrap_or(1.0);
         // CPU seconds on the scoring machine per CPU second measured where the costs were estimated
-        let cpux: f64 = std::env::var("BR_CPUX").ok().and_then(|x| x.parse().ok()).unwrap_or(1.0);
+        let cpux: f64 = std::env::var("BR_CPUX").ok().and_then(|x| x.parse().ok()).unwrap_or(1.12);
         let vhits: BTreeSet<usize> = p.run.iter().filter(|&&i| i >= n).map(|&i| i - n).collect();
         let mut real: BTreeSet<usize> = p.run.iter().copied().filter(|&i| i < n).collect();
         let mut forced: BTreeSet<usize> = BTreeSet::new();
@@ -562,6 +593,12 @@ impl Ctx {
                     } else {
                         hits.push((self.map.vcost.get(&v).copied().unwrap_or(0), it.to_string()));
                     }
+                }
+            }
+            if *name == "fx_test_annotate_funcs" {
+                // measured: entries cost ~2.2x their isolated estimate when run together
+                for h in hits.iter_mut() {
+                    h.0 = h.0 * 22 / 10;
                 }
             }
             if *name == "max_nodes" {
@@ -672,13 +709,15 @@ impl Ctx {
             let nt = real.len();
             let overhead: u64 = 130 + files.iter().map(|f| Self::file_overhead(f)).sum::<u64>();
             // prior that every candidate passes (surviving mutants are common on small sets)
-            let p0: f64 = if nt <= 3 { 0.55 } else if nt <= 10 { 0.5 } else if nt <= 30 { 0.4 } else { 0.3 };
+            let p0: f64 = if nt <= 3 { 0.5 } else if nt <= 10 { 0.4 } else if nt <= 30 { 0.4 } else { 0.6 };
             let run_cost = ((sum as f64 * 1.05 * crun + overhead as f64 + (1.0 - p0) * 300.0) * cpux) as u64;
             let base = pack_cost(&self.tests, &forced);
             let mut all = forced.clone();
             all.extend(real.iter().copied());
             let inc = pack_cost(&self.tests, &all) - base;
-            let gain = (p0 * inc as f64) as u64;
+            // even when some fail, only the failures stay included (about half the set's load)
+            let partial = (inc as f64 - 2000.0 - sum as f64 / 2.0).max(0.0);
+            let gain = (p0 * inc as f64 + (1.0 - p0) * partial) as u64;
             if run_cost < gain {
                 log!("{}: run {} light tests (run {}ms < expected gain {}ms of {}ms)", p.commit, nt, run_cost, gain, inc);
             } else {
@@ -824,6 +863,10 @@ impl Ctx {
         // Any test reading this file as text sees every change.
         if let Some(s) = fm.src {
             self.add_set(&mut p.run, s);
+        }
+        if std::env::var("BR_NOEQ").is_err() && identity_swap_only(&patch::touches(&fp.hunks), &fm.eqsafe) {
+            log!("{}: {path}: is/== swap where both always agreed: only source readers", p.commit);
+            return;
         }
         let head_changed = old.lines().take(2).ne(new.lines().take(2));
         if pyline::comment_only(old, new) && !(head_changed && (old.lines().take(2).any(|l| l.contains("coding")) || new.lines().take(2).any(|l| l.contains("coding")))) {
