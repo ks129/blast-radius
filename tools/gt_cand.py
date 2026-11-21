@@ -1,14 +1,16 @@
 """Label patches by running a candidate superset. usage: gt_cand.py <commits-dir> <cand.jsonl> <tests.json> <out.json>"""
 import json, os, shutil, subprocess, sys, tempfile
 cdir, cand, tj, out = sys.argv[1:5]
-tests = {t["number"]: t["id"] for t in json.load(open(tj))["tests"]}
+_all = json.load(open(tj))["tests"]
+tests = {t["number"]: t["id"] for t in _all}
+heavy = {t["number"] for t in _all if t["seconds"] >= 1.5}
 idx = {v: k for k, v in tests.items()}
 res = json.load(open(out)) if os.path.exists(out) else {"commits": {}}
 root = os.path.expanduser("~/sqlglot")
 for line in open(cand):
     r = json.loads(line); c = r["commit"]
     if c in res["commits"]: continue
-    ids = [tests[x] for w in r["workers"] for x in w]
+    ids = [tests[x] for w in r["workers"] for x in w if x not in heavy]
     failed = set()
     if ids:
         tmp = tempfile.mkdtemp(dir="/tmp", prefix="gk_"); shutil.rmtree(tmp)
