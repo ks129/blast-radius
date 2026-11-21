@@ -174,6 +174,7 @@ struct Ctx {
     texts: Mutex<HashMap<String, String>>,
     norm_cache: Mutex<HashMap<String, String>>,
     data_index: Mutex<Option<HashMap<u32, Vec<String>>>>,
+    astcheck: Mutex<Option<(Child, ChildStdin, BufReader<ChildStdout>)>>,
 }
 
 /// `"KEY": value,` -> KEY (string-keyed dict entry, key of 3+ chars)
@@ -334,6 +335,11 @@ const ADAPTERS: &[(&str, &str)] = &[
     ("opt_tpch", "tests/test_executor.py::TestExecutor::test_optimized_tpch"),
     ("gen_memory", "tests/test_generator.py::TestGenerator::test_generator_memory"),
     ("max_nodes", "tests/test_parser.py::TestParser::test_max_nodes"),
+    ("fx_test_qualify_columns", "tests/test_optimizer.py::TestOptimizer::test_qualify_columns"),
+    ("fx_test_annotate_funcs", "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs"),
+    ("fx_test_tpcds", "tests/test_optimizer.py::TestOptimizer::test_tpcds"),
+    ("fx_test_canonicalize", "tests/test_optimizer.py::TestOptimizer::test_canonicalize"),
+    ("fx_test_merge_subqueries", "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries"),
 ];
 
 fn pack_cost(tests: &[Test], sel: &BTreeSet<usize>) -> u64 {
@@ -468,6 +474,37 @@ impl Ctx {
         idx.as_ref().unwrap().get(&(m as u32)).cloned().unwrap_or_default()
     }
 
+    fn ast_verdict(&self, old: &Path, new_text: &str) -> Option<String> {
+        if std::env::var("BR_NOAST").is_ok() {
+            return None;
+        }
+        let mut g = self.astcheck.lock().unwrap();
+        if g.is_none() {
+            let python = std::env::var("BR_PYTHON").unwrap_or("python".into());
+            let app = PathBuf::from(std::env::var("BR_APP").unwrap_or("/app".into()));
+            let mut child = Command::new(python)
+                .arg("-I")
+                .arg(app.join("astcheck.py"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?;
+            let stdin = child.stdin.take()?;
+            let stdout = BufReader::new(child.stdout.take()?);
+            *g = Some((child, stdin, stdout));
+        }
+        let (_, stdin, stdout) = g.as_mut()?;
+        let tmp = PathBuf::from(std::env::var("BR_TMP").unwrap_or("/tmp".into())).join("astcheck_new.py");
+        fs::write(&tmp, new_text).ok()?;
+        writeln!(stdin, "{}\t{}", old.display(), tmp.display()).ok()?;
+        stdin.flush().ok()?;
+        let mut l = String::new();
+        stdout.read_line(&mut l).ok()?;
+        let _ = fs::remove_file(&tmp);
+        Some(l.trim().to_string())
+    }
+
     fn file_overhead(file: &str) -> u64 {
         match file {
             "tests/test_executor.py" => 700,
@@ -513,6 +550,12 @@ impl Ctx {
             }
             let data_change = p.changed.iter().any(|(f, _)| !f.ends_with(".py"));
             let mut exhaustive = false;
+            if name.starts_with("fx_") && p.data_hits.contains(&t) && !p.code_hits.contains(&t) {
+                // it reads an edited fixture: such tests almost always fail
+                log!("{}: include {} (reads an edited data file)", p.commit, name);
+                forced.insert(t);
+                continue;
+            }
             let tpc_fixture = p.changed.iter().all(|(f, c)| {
                 !f.ends_with(".py") && c.is_some() && (f.ends_with("tpc-ds/tpc-ds.sql") || f.ends_with("tpc-h/tpc-h.sql"))
             });
@@ -533,7 +576,15 @@ impl Ctx {
                 }
                 exhaustive = true;
             }
-            let setup: u64 = if name.starts_with("exec") || name.starts_with("opt") { 1200 } else { 100 };
+            let setup: u64 = if name.starts_with("exec") || name.starts_with("opt") {
+                1200
+            } else if name.starts_with("fx_") {
+                // optimizer class set-up plus the test's non-fixture part
+                let base_id = format!("ADAPT::{name}::base");
+                250 + self.map.ids.iter().position(|id| *id == base_id).and_then(|v| self.map.vcost.get(&v).copied()).unwrap_or(500)
+            } else {
+                100
+            };
             let full: u64 = hits.iter().map(|h| h.0).sum();
             let limit = 0.6 * (d + 2000) as f64 / cpux;
             if base_hit {
@@ -545,8 +596,9 @@ impl Ctx {
             } else if ((full + setup) as f64) <= limit {
                 log!("{}: adapter {} on all {} hit items (est {}ms)", p.commit, name, hits.len(), full + setup);
                 p.adapters.push((name.to_string(), hits.into_iter().map(|h| h.1).collect(), t, full + setup));
-            } else if exhaustive {
-                log!("{}: include {} (data change, all items too costly)", p.commit, name);
+            } else if exhaustive || name.starts_with("fx_") {
+                // no sampling where a single breaking item would be a miss
+                log!("{}: include {} (all {} reached items too costly)", p.commit, name, hits.len());
                 forced.insert(t);
             } else {
                 // too many reachable items: run a cheap sample; a broad breakage shows up in it
@@ -664,7 +716,23 @@ impl Ctx {
             let path = oldp.clone().or(newp.clone()).unwrap_or_default();
             let before = std::mem::take(&mut p.run);
             self.select_file(&mut p, &path, old_text.as_deref(), if newp.is_some() { new_text.as_deref() } else { None }, fp, oldp.is_none(), newp.is_none() || oldp != newp);
-            let got = std::mem::replace(&mut p.run, before);
+            let mut got = std::mem::replace(&mut p.run, before);
+            // a large selection for an edit that might be inert: ask the AST checker
+            if path.ends_with(".py") && got.len() > 20 && oldp.is_some() && oldp == newp {
+                if let (Some(o), Some(nt)) = (&oldp, &new_text) {
+                    if let Some(verdict) = self.ast_verdict(&self.src_root.join(o), nt) {
+                        if verdict != "DIFF" {
+                            log!("{commit}: {path}: inert edit ({verdict}): only source readers");
+                            got.clear();
+                            if let Some(fm) = self.map.files.get(o.as_str()) {
+                                if let Some(s) = fm.src {
+                                    self.add_set(&mut got, s);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if path.ends_with(".py") {
                 p.code_hits.extend(got.iter().copied());
             } else {
@@ -1099,7 +1167,7 @@ fn main() {
     let id2t_owned: HashMap<String, usize> = id2t.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     drop(id2t);
     let t2map: HashMap<usize, usize> = map2t.iter().enumerate().filter_map(|(m, t)| t.map(|t| (t, m))).collect();
-    let ctx = Ctx { src_root: src_root.clone(), tests, map, map2t, by_file, id2t: id2t_owned, t2map, texts: Mutex::new(HashMap::new()), norm_cache: Mutex::new(HashMap::new()), data_index: Mutex::new(None) };
+    let ctx = Ctx { src_root: src_root.clone(), tests, map, map2t, by_file, id2t: id2t_owned, t2map, texts: Mutex::new(HashMap::new()), norm_cache: Mutex::new(HashMap::new()), data_index: Mutex::new(None), astcheck: Mutex::new(None) };
 
     let mut commits: Vec<(String, PathBuf)> = Vec::new();
     if let Ok(rd) = fs::read_dir(data.join("commits")) {

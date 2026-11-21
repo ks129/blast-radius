@@ -124,8 +124,7 @@ def run_adapters(adapts, wfd):
             adapters.setup(name)
             if its == ["AUTO"]:
                 its = adapters.auto_items(name)
-            for it in its:
-                adapters.run_item(name, it)
+            adapters.run_items(name, its)
         except BaseException as e:
             ok = False
             if os.environ.get("BR_DEBUG"):
@@ -289,7 +288,8 @@ def handle(jobid, root, base, items, pre, probes, adapts=(), stopfail=False):
     ids = [i for _, i in items]
 
     def timeout(nodeid):
-        return base + 4.0 * tmult.get(nodeid, 0.0)
+        # a test far past its recorded time counts as failing (a hang costs little this way)
+        return 6.0 + 5.0 * tmult.get(nodeid, 0.0)
 
     todo = list(ids)
     fail, passed, unknown = set(), set(), set()

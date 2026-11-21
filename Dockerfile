@@ -15,7 +15,7 @@ RUN mkdir -p /app/src \
  && rm /tmp/sqlglot.tar.gz \
  && python -m compileall -q /app/src/sqlglot /app/src/tests > /dev/null; \
     python -m compileall -q /usr/local/lib/python3.13 > /dev/null; true
-COPY app/runner.py app/adapters.py app/map.txt.gz /app/
+COPY app/runner.py app/adapters.py app/astcheck.py app/map.txt.gz /app/
 RUN gunzip /app/map.txt.gz && python -m compileall -q /app/runner.py /app/adapters.py > /dev/null; true
 COPY --from=build /b/target/release/selector /app/selector
 RUN chmod -R a+rX /app

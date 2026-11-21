@@ -6,6 +6,8 @@ If they all pass the heavy test is left out, otherwise it is included.
 """
 import pickle
 
+FIXTURE_TESTS = ("test_qualify_columns", "test_annotate_funcs", "test_tpcds", "test_canonicalize", "test_merge_subqueries")
+
 TESTS = {
     "exec_tpcds": "tests/test_executor.py::TestExecutor::test_execute_tpcds",
     "exec_tpch": "tests/test_executor.py::TestExecutor::test_execute_tpch",
@@ -13,6 +15,69 @@ TESTS = {
     "gen_memory": "tests/test_generator.py::TestGenerator::test_generator_memory",
     "max_nodes": "tests/test_parser.py::TestParser::test_max_nodes",
 }
+for _t in FIXTURE_TESTS:
+    TESTS["fx_" + _t] = f"tests/test_optimizer.py::TestOptimizer::{_t}"
+
+
+class _InlineExecutor:
+    """Runs pool submissions in-process, pickling arguments and results like a pool would."""
+
+    def submit(self, fn, *args, **kwargs):
+        from concurrent.futures import Future
+
+        fut = Future()
+        try:
+            a, k = pickle.loads(pickle.dumps((args, kwargs)))
+            fut.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+        except BaseException as e:  # noqa: BLE001
+            fut.set_exception(e)
+        return fut
+
+    def shutdown(self, *a, **k):
+        pass
+
+
+_opt = {}
+
+
+def _optimizer():
+    if "m" not in _opt:
+        import tests.test_optimizer as m
+
+        orig_pool = m.ProcessPoolExecutor
+        m.ProcessPoolExecutor = lambda *a, **k: _InlineExecutor()
+        try:
+            m.TestOptimizer.setUpClass()
+        finally:
+            m.ProcessPoolExecutor = orig_pool
+        _opt["m"] = m
+        _opt["loader"] = m.load_sql_fixture_pairs
+    return _opt["m"]
+
+
+def _run_fixture_test(method, selected):
+    """Run one TestOptimizer test with fixture loading restricted to `selected` (file, index) pairs."""
+    m = _optimizer()
+    orig = _opt["loader"]
+    seen = []
+
+    def loader(filename):
+        for i, entry in enumerate(orig(filename)):
+            seen.append((filename, i))
+            if selected is None or (filename, i) in selected:
+                yield entry
+
+    m.load_sql_fixture_pairs = loader
+    try:
+        inst = m.TestOptimizer(method)
+        inst.setUp()
+        try:
+            getattr(inst, method)()
+        finally:
+            inst.tearDown()
+    finally:
+        m.load_sql_fixture_pairs = orig
+    return seen
 
 _exec = {}
 
@@ -92,6 +157,28 @@ def items(name):
         return [str(d.value) for d in Dialects]
     if name == "max_nodes":
         return ["proxy"]
+    if name.startswith("fx_"):
+        # every fixture entry the test loads (the dry run loads all entries, runs none)
+        m = _optimizer()
+        orig = _opt["loader"]
+        seen = []
+
+        def loader(filename):
+            for i, _ in enumerate(orig(filename)):
+                seen.append(f"{filename}#{i}")
+            return iter(())
+
+        m.load_sql_fixture_pairs = loader
+        try:
+            inst = m.TestOptimizer(name[3:])
+            try:
+                inst.setUp()
+                getattr(inst, name[3:])()
+            except Exception:
+                pass
+        finally:
+            m.load_sql_fixture_pairs = orig
+        return seen
     return []
 
 
@@ -117,6 +204,21 @@ def auto_items(name):
 def setup(name):
     if name in ("exec_tpcds", "exec_tpch", "opt_tpch"):
         _executor()
+    elif name.startswith("fx_"):
+        _optimizer()
+
+
+def run_items(name, its):
+    """Run several items at once (fixture tests run their non-fixture part once)."""
+    if name.startswith("fx_"):
+        sel = set()
+        for it in its:
+            f, _, i = it.rpartition("#")
+            sel.add((f, int(i)))
+        _run_fixture_test(name[3:], sel)
+        return
+    for it in its:
+        run_item(name, it)
 
 
 def run_item(name, item):
@@ -172,6 +274,13 @@ def run_item(name, item):
         finally:
             tracemalloc.stop()
         assert after - before < 1024, (item, after - before)
+        return
+    if name.startswith("fx_"):
+        if item == "base":
+            _run_fixture_test(name[3:], set())
+        else:
+            f, _, i = item.rpartition("#")
+            _run_fixture_test(name[3:], {(f, int(i))})
         return
     if name == "max_nodes":
         from sqlglot import exp, parse_one

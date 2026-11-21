@@ -16,7 +16,13 @@ for name in dict.fromkeys(r["id"].split("::")[1] for r in recs):
     c0 = time.process_time()
     adapters.setup(name)
     cpu[f"ADAPT::{name}::base"] = time.process_time() - c0
-    for it in adapters.items(name):
+    its_all = adapters.items(name)
+    if name.startswith("fx_"):
+        c0 = time.process_time()
+        adapters.run_item(name, "base")
+        cpu[f"ADAPT::{name}::base"] = time.process_time() - c0
+    base_cost = cpu.get(f"ADAPT::{name}::base", 0.0) if name.startswith("fx_") else 0.0
+    for it in its_all:
         # cost with a cold table cache: lazily loaded tables are part of an item's price
         if name.startswith("exec") or name == "opt_tpch":
             inst = adapters._exec["inst"]
@@ -28,7 +34,7 @@ for name in dict.fromkeys(r["id"].split("::")[1] for r in recs):
             adapters.run_item(name, it)
         except Exception as e:
             print("fail", name, it, e, file=sys.stderr)
-        cpu[f"ADAPT::{name}::{it}"] = time.process_time() - c0
+        cpu[f"ADAPT::{name}::{it}"] = max(0.0, time.process_time() - c0 - base_cost)
 with open(sys.argv[2], "w") as fh:
     for r in recs:
         r["cpu"] = cpu.get(r["id"], r["cpu"])

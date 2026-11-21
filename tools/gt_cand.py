@@ -19,7 +19,7 @@ for line in open(cand):
         env = dict(os.environ, SKIP_INTEGRATION="0", GT_OUT=tmp + "/gt.txt", PYTHONPATH=os.path.expanduser("~/tools"), PYTHONDONTWRITEBYTECODE="1")
         env["PATH"] = os.path.expanduser("~/venv/bin") + ":" + env["PATH"]
         open(tmp + "/ids.txt", "w").write("\n".join(ids))
-        subprocess.run(["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "gtplug", "-n", "3", "--timeout=900",
+        subprocess.run(["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "gtplug", "-n", "3", "--timeout=60",
                         "--continue-on-collection-errors"] + ids, cwd=tmp, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for l in open(tmp + "/gt.txt").read().split():
             if l in idx: failed.add(idx[l])

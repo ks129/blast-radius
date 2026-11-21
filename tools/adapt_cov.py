@@ -77,9 +77,12 @@ import tests.test_parser  # noqa: E402,F401
 
 for name in sys.argv[2:]:
     t0, c0 = time.perf_counter(), time.process_time()
+    its = adapters.items(name)
+    t0, c0 = time.perf_counter(), time.process_time()
     start()
     adapters.setup(name)
-    its = adapters.items(name)
+    if name.startswith("fx_"):
+        adapters.run_item(name, "base")  # the test's non-fixture part
     stop(f"ADAPT::{name}::base", out, t0, c0)
     for it in its:
         t0, c0 = time.perf_counter(), time.process_time()
