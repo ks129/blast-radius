@@ -75,9 +75,30 @@ class Reporter:
     def pytest_runtest_logfinish(self, nodeid, location):
         self._send("E", nodeid)
 
+    def pytest_collection_modifyitems(self, session, config, items):
+        # TestExecutor.setUpClass parses every TPC CSV up front (1.4 s); the adapters build the
+        # same class state with tables parsed on first use. Only when that test file and its
+        # helpers are the pinned ones (symlinks in the farm).
+        m = sys.modules.get("tests.test_executor")
+        if m is None:
+            return
+        root = os.getcwd()
+        if not all(os.path.realpath(os.path.join(root, p)).startswith(SRC + os.sep) for p in ("tests/test_executor.py", "tests/helpers.py")):
+            return
+        try:
+            import adapters
+
+            def lazy_setup(cls):
+                adapters._executor()
+
+            m.TestExecutor.setUpClass = classmethod(lazy_setup)
+        except Exception:
+            pass
+
 
 def probe(root, probes, wfd):
     import importlib
+    bad = False
     for mod, rel in probes:
         try:
             with open(os.path.join(root, rel), encoding="utf-8") as fh:
@@ -90,6 +111,8 @@ def probe(root, probes, wfd):
                 with open("/tmp/probe_err.txt", "a") as fh:
                     fh.write(rel + "\n" + traceback.format_exc() + "\n")
             os.write(wfd, ("I " + rel + "\n").encode())
+            bad = True
+    return bad
 
 
 def run_adapters(adapts, wfd):
@@ -184,12 +207,14 @@ def child(root, ids, wfd, pre, probes=(), adapts=()):
         os.dup2(devnull, 1)
         os.dup2(devnull, 2)
         if probes:
-            probe(root, probes, wfd)
+            if probe(root, probes, wfd):
+                os._exit(0)  # a changed module does not import: everything else is moot
         if adapts:
             run_adapters(adapts, wfd)
         if not ids:
             os._exit(0)
-        args = ["-q", "-p", "no:cacheprovider", "-p", "no:randomly", "--rootdir", root, "-o", "addopts="] + list(ids)
+        args = ["-q", "-p", "no:cacheprovider", "-p", "no:randomly", "--rootdir", root, "-o", "addopts=",
+                "--tb=no", "--assert=plain"] + list(ids)
         pytest.main(args, plugins=[Reporter(wfd, ids)])
     except BaseException:
         pass
@@ -197,7 +222,7 @@ def child(root, ids, wfd, pre, probes=(), adapts=()):
         os._exit(0)
 
 
-def run_batch(root, ids, timeout, pre, probes=(), adapts=(), idle=30.0):
+def run_batch(root, ids, timeout, pre, probes=(), adapts=(), idle=30.0, stopfail=False):
     """Returns (failed set, finished set, culprit or None)."""
     r, w = os.pipe()
     pid = os.fork()
@@ -213,7 +238,8 @@ def run_batch(root, ids, timeout, pre, probes=(), adapts=(), idle=30.0):
     started_at = time.monotonic()
     buf = b""
     timed_out = False
-    while True:
+    stopped = False
+    while not stopped:
         limit = timeout(current) if current else idle
         remaining = started_at + limit - time.monotonic()
         if remaining <= 0:
@@ -238,6 +264,8 @@ def run_batch(root, ids, timeout, pre, probes=(), adapts=(), idle=30.0):
                 finished.add(nodeid)
                 current = None
                 started_at = time.monotonic()
+                if stopfail and failed:
+                    stopped = True
             elif kind == "C":
                 collect_fail.append(nodeid)
             elif kind == "I":
@@ -245,7 +273,7 @@ def run_batch(root, ids, timeout, pre, probes=(), adapts=(), idle=30.0):
             elif kind == "A":
                 adapt_res.append(nodeid)
                 started_at = time.monotonic()
-    if timed_out:
+    if timed_out or stopped:
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -256,7 +284,7 @@ def run_batch(root, ids, timeout, pre, probes=(), adapts=(), idle=30.0):
     return failed, finished, collect_fail, culprit, import_fail, adapt_res
 
 
-def handle(jobid, root, base, items, pre, probes, adapts=()):
+def handle(jobid, root, base, items, pre, probes, adapts=(), stopfail=False):
     tmult = dict((i, m) for m, i in items)
     ids = [i for _, i in items]
 
@@ -276,9 +304,16 @@ def handle(jobid, root, base, items, pre, probes, adapts=()):
             unknown |= set(todo)
             break
         tset = set(todo)
-        f, fin, cfail, culprit, ifl, _ = run_batch(root, todo, timeout, pre, probes if rounds == 1 else ())
-        if rounds == 1:
+        first = rounds == 1
+        f, fin, cfail, culprit, ifl, ar = run_batch(
+            root, todo, timeout, pre, probes if first else (), adapts if first else (),
+            idle=base if adapts else max(base, 30.0), stopfail=stopfail)
+        if first:
             ifail = ifl
+            ares = ar
+            if ifl:
+                unknown |= set(todo)
+                break
         fail |= {x for x in f if x in tset}
         for c in cfail:
             for x in todo:
@@ -290,7 +325,7 @@ def handle(jobid, root, base, items, pre, probes, adapts=()):
             if x in fin and x not in fail:
                 passed.add(x)
         nxt = [x for x in todo if x not in fail and x not in passed]
-        if not culprit:
+        if not culprit or (stopfail and fail):
             unknown |= set(nxt)
             break
         todo = nxt
@@ -312,10 +347,14 @@ def main():
         items = []
         probes = []
         adapts = []
+        stopfail = False
         while True:
             l2 = inp.readline().rstrip("\n")
             if l2 == "END" or l2 == "":
                 break
+            if l2 == "STOPFAIL":
+                stopfail = True
+                continue
             if l2.startswith("ADAPT "):
                 _, name, its = l2.split(" ", 2)
                 adapts.append((name, its.split(",")))
@@ -341,7 +380,7 @@ def main():
             OUT.flush()
             continue
         probes = [(m[len("COMPILE:"):] if m.startswith("COMPILE:") else m, r) for m, r in probes]
-        fail, passed, unknown, ifail, ares = handle(jobid, root, float(base), items, pre, probes, adapts)
+        fail, passed, unknown, ifail, ares = handle(jobid, root, float(base), items, pre, probes, adapts, stopfail)
         out = ["RES " + jobid]
         out += ["F " + x for x in sorted(fail)]
         out += ["P " + x for x in sorted(passed)]

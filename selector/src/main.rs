@@ -24,6 +24,8 @@ struct Test {
 #[derive(Default)]
 struct FileMap {
     units: Vec<(u32, u32, u32)>,
+    /// statement headers inside function bodies
+    hdrs: Vec<(u32, u32, u32)>,
     stmts: Vec<(u32, u32, u32)>,
     classes: Vec<(u32, u32, u32)>,
     docs: Vec<(u32, u32, u32)>,
@@ -95,6 +97,10 @@ fn load_map(path: &Path) -> Map {
                 let v: Vec<u32> = rest.split(' ').map(|x| x.parse().unwrap()).collect();
                 m.files.get_mut(cur.as_ref().unwrap()).unwrap().units.push((v[0], v[1], v[2]));
             }
+            "H" => {
+                let v: Vec<u32> = rest.split(' ').map(|x| x.parse().unwrap()).collect();
+                m.files.get_mut(cur.as_ref().unwrap()).unwrap().hdrs.push((v[0], v[1], v[2]));
+            }
             "X" | "C" | "Z" => {
                 let v: Vec<u32> = rest.split(' ').map(|x| x.parse().unwrap()).collect();
                 let f = m.files.get_mut(cur.as_ref().unwrap()).unwrap();
@@ -139,6 +145,9 @@ fn load_tests(path: &Path) -> Vec<Test> {
 /// What a commit needs.
 struct Plan {
     commit: String,
+    /// candidates reached through changed code / only through changed data files
+    code_hits: BTreeSet<usize>,
+    data_hits: BTreeSet<usize>,
     /// module- or class-level code changed: the module may no longer import
     static_change: bool,
     /// (adapter, items, heavy test index, estimated ms)
@@ -163,6 +172,8 @@ struct Ctx {
     /// tests vec index -> map test index
     t2map: HashMap<usize, usize>,
     texts: Mutex<HashMap<String, String>>,
+    norm_cache: Mutex<HashMap<String, String>>,
+    data_index: Mutex<Option<HashMap<u32, Vec<String>>>>,
 }
 
 /// `"KEY": value,` -> KEY (string-keyed dict entry, key of 3+ chars)
@@ -197,6 +208,107 @@ fn keyed_ok(t: &patch::Touch, x: (u32, u32, u32)) -> bool {
         !(x.0 <= a && a <= x.1) || lines.iter().all(|l| dict_key(l).is_some() || l.trim().is_empty())
     });
     removed_ok && inserted_ok
+}
+
+const PY_KW: &[&str] = &[
+    "False", "None", "True", "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
+    "else", "except", "finally", "for", "from", "global", "if", "import", "in", "is", "lambda", "nonlocal", "not", "or",
+    "pass", "raise", "return", "try", "while", "with", "yield", "match", "case",
+];
+
+fn idents(code: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_str: Option<char> = None;
+    for c in code.chars() {
+        if let Some(q) = in_str {
+            if c == q {
+                in_str = None;
+            }
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            in_str = Some(c);
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out.retain(|w| !w.chars().next().map_or(true, |c| c.is_ascii_digit()) && !PY_KW.contains(&w.as_str()));
+    out.sort();
+    out
+}
+
+fn binds(code: &str) -> bool {
+    let b = code.as_bytes();
+    for i in 0..b.len() {
+        if b[i] == b'=' {
+            let prev = if i > 0 { b[i - 1] } else { b' ' };
+            let next = if i + 1 < b.len() { b[i + 1] } else { b' ' };
+            if !matches!(prev, b'=' | b'!' | b'<' | b'>') && next != b'=' {
+                return true;
+            }
+        }
+    }
+    let padded = format!(" {code} ");
+    [":=", " as ", " for ", " import ", " global ", " nonlocal ", " yield", " lambda", " del ", " def ", " class "]
+        .iter()
+        .any(|k| padded.contains(k))
+}
+
+/// Can a function-body edit be judged statement by statement? Only for like-for-like line
+/// replacements that keep the block structure and the set of names bound.
+fn stmt_guard(t: &patch::Touch, info: &[pyline::LineInfo]) -> bool {
+    let removed: Vec<(usize, String)> = t
+        .removed
+        .iter()
+        .zip(&t.removed_text)
+        .filter(|(&l, _)| info.get(l - 1).map_or(false, |x| x.has_code))
+        .map(|(&l, txt)| (l, txt.clone()))
+        .collect();
+    let added_info = pyline::analyze(&t.added_text.join("\n"));
+    let added: Vec<(String, &pyline::LineInfo)> = t
+        .added_text
+        .iter()
+        .zip(added_info.iter())
+        .filter(|(_, li)| li.has_code)
+        .map(|(s, li)| (s.clone(), li))
+        .collect();
+    if removed.is_empty() || removed.len() != added.len() {
+        return false;
+    }
+    if t.inserted.iter().any(|(_, lines, rep)| !rep && lines.iter().any(|l| !l.trim().is_empty())) {
+        return false;
+    }
+    for ((l, old), (new, nli)) in removed.iter().zip(added.iter()) {
+        let oi = info.get(l - 1);
+        if oi.and_then(|x| x.indent) != nli.indent {
+            return false;
+        }
+        let ow = old.split_whitespace().next().unwrap_or("");
+        let nw = new.split_whitespace().next().unwrap_or("");
+        const STMT_KW: &[&str] = &[
+            "if", "elif", "else", "for", "while", "return", "try", "except", "finally", "with", "def", "class", "raise",
+            "assert", "del", "pass", "break", "continue", "yield", "import", "from", "global", "nonlocal", "async", "await",
+            "match", "case",
+        ];
+        let kw = |w: &str| STMT_KW.iter().find(|k| w == **k || w.starts_with(&format!("{k}(")) || w.starts_with(&format!("{k}:")));
+        if kw(ow) != kw(nw) {
+            return false;
+        }
+        let oc = oi.map(|x| x.code.clone()).unwrap_or_default();
+        let nc = nli.code.clone();
+        if idents(&oc) != idents(&nc) && (binds(&oc) || binds(&nc)) {
+            return false;
+        }
+    }
+    true
 }
 
 fn norm(s: &str) -> String {
@@ -267,31 +379,50 @@ impl Ctx {
             return true; // adapter items decide for themselves
         }
         let norm_keys: Vec<String> = keys.iter().map(|k| norm(k)).collect();
-        let hit = |text: &str| {
-            let t = norm(text);
-            norm_keys.iter().any(|k| t.contains(k.as_str()))
-        };
+        let hit = |t: &str| norm_keys.iter().any(|k| t.contains(k.as_str()));
         let test = &self.tests[i];
-        let src = self.text(&test.file);
-        let mt = self.t2map.get(&i).copied();
-        match mt.and_then(|m| self.map.mranges.get(&m).copied()) {
-            Some((a, b)) => {
-                let body: Vec<&str> = src.lines().skip(a - 1).take(b + 1 - a).collect();
-                if hit(&body.join("\n")) {
-                    return true;
-                }
-                // text outside any test method (module constants, helpers) counts for the whole file
-                if hit(&self.outside_tests(&test.file)) {
-                    return true;
+        let Some(m) = self.t2map.get(&i).copied() else { return true };
+        let Some((a, b)) = self.map.mranges.get(&m).copied() else { return true };
+        let body = {
+            let mut c = self.norm_cache.lock().unwrap();
+            c.entry(format!("body:{m}"))
+                .or_insert_with(|| {
+                    let src = self.text(&test.file);
+                    norm(&src.lines().skip(a - 1).take(b + 1 - a).collect::<Vec<_>>().join("\n"))
+                })
+                .clone()
+        };
+        if hit(&body) {
+            return true;
+        }
+        let outside = {
+            let key = format!("out:{}", test.file);
+            let cached = self.norm_cache.lock().unwrap().get(&key).cloned();
+            match cached {
+                Some(t) => t,
+                None => {
+                    let t = norm(&self.outside_tests(&test.file));
+                    self.norm_cache.lock().unwrap().insert(key, t.clone());
+                    t
                 }
             }
-            None => return true,
+        };
+        if hit(&outside) {
+            return true;
         }
-        if let Some(m) = mt {
-            for f in self.data_files_of(m) {
-                if hit(&self.text(&f)) {
-                    return true;
+        for f in self.data_files_of(m) {
+            let key = format!("data:{f}");
+            let cached = self.norm_cache.lock().unwrap().get(&key).cloned();
+            let t = match cached {
+                Some(t) => t,
+                None => {
+                    let t = norm(&self.text(&f));
+                    self.norm_cache.lock().unwrap().insert(key, t.clone());
+                    t
                 }
+            };
+            if hit(&t) {
+                return true;
             }
         }
         false
@@ -305,8 +436,9 @@ impl Ctx {
     fn outside_tests(&self, file: &str) -> String {
         let src = self.text(file);
         let mut inside = vec![false; src.lines().count() + 2];
+        let prefix = format!("{file}::");
         for (&m, &(a, b)) in &self.map.mranges {
-            if self.map.ids.get(m).map_or(false, |id| id.starts_with(&format!("{file}::"))) {
+            if self.map.ids.get(m).map_or(false, |id| id.starts_with(&prefix)) {
                 for l in a..=b.min(inside.len() - 1) {
                     inside[l] = true;
                 }
@@ -316,25 +448,31 @@ impl Ctx {
     }
 
     fn data_files_of(&self, m: usize) -> Vec<String> {
-        let mut out = Vec::new();
-        for (f, fm) in &self.map.files {
-            if f.ends_with(".py") || f.starts_with("dir:") {
-                continue;
-            }
-            if let Some(d) = fm.dep {
-                if self.map.sets.get(d as usize).map_or(false, |s| s.binary_search(&(m as u32)).is_ok()) {
-                    out.push(f.clone());
+        let mut idx = self.data_index.lock().unwrap();
+        if idx.is_none() {
+            let mut inv: HashMap<u32, Vec<String>> = HashMap::new();
+            for (f, fm) in &self.map.files {
+                if f.ends_with(".py") || f.starts_with("dir:") {
+                    continue;
+                }
+                if let Some(d) = fm.dep {
+                    if let Some(set) = self.map.sets.get(d as usize) {
+                        for &t in set {
+                            inv.entry(t).or_default().push(f.clone());
+                        }
+                    }
                 }
             }
+            *idx = Some(inv);
         }
-        out
+        idx.as_ref().unwrap().get(&(m as u32)).cloned().unwrap_or_default()
     }
 
     fn file_overhead(file: &str) -> u64 {
         match file {
-            "tests/test_executor.py" => 3200,
-            "tests/test_optimizer.py" => 400,
-            _ => 40,
+            "tests/test_executor.py" => 700,
+            "tests/test_optimizer.py" => 30,
+            _ => 10,
         }
     }
 
@@ -344,7 +482,7 @@ impl Ctx {
         let heavy_ms: u64 = std::env::var("BR_HEAVY_MS").ok().and_then(|x| x.parse().ok()).unwrap_or(1500);
         let crun: f64 = std::env::var("BR_C").ok().and_then(|x| x.parse().ok()).unwrap_or(1.0);
         // CPU seconds on the scoring machine per CPU second measured where the costs were estimated
-        let cpux: f64 = std::env::var("BR_CPUX").ok().and_then(|x| x.parse().ok()).unwrap_or(4.0);
+        let cpux: f64 = std::env::var("BR_CPUX").ok().and_then(|x| x.parse().ok()).unwrap_or(1.0);
         let vhits: BTreeSet<usize> = p.run.iter().filter(|&&i| i >= n).map(|&i| i - n).collect();
         let mut real: BTreeSet<usize> = p.run.iter().copied().filter(|&i| i < n).collect();
         let mut forced: BTreeSet<usize> = BTreeSet::new();
@@ -395,7 +533,7 @@ impl Ctx {
                 }
                 exhaustive = true;
             }
-            let setup: u64 = if name.starts_with("exec") || name.starts_with("opt") { 1500 } else { 200 };
+            let setup: u64 = if name.starts_with("exec") || name.starts_with("opt") { 1200 } else { 100 };
             let full: u64 = hits.iter().map(|h| h.0).sum();
             let limit = 0.6 * (d + 2000) as f64 / cpux;
             if base_hit {
@@ -438,24 +576,37 @@ impl Ctx {
             real.remove(&h);
             forced.insert(h);
         }
-        // light tests: run them, or include them unrun if that is cheaper
+        // tests reached only through an edited data file almost always fail: include them
+        let data_only: Vec<usize> = real.iter().copied().filter(|i| p.data_hits.contains(i) && !p.code_hits.contains(i)).collect();
+        if !data_only.is_empty() {
+            log!("{}: include {} data-file readers unrun", p.commit, data_only.len());
+            for i in data_only {
+                real.remove(&i);
+                forced.insert(i);
+            }
+        }
+        // light tests: run them when the expected saving beats the CPU they cost
         if !real.is_empty() {
             let mut files: HashSet<&str> = HashSet::new();
             let mut sum = 0u64;
             for &i in &real {
-                sum += self.tests[i].ms + 1;
+                sum += self.tests[i].ms;
                 files.insert(self.tests[i].file.as_str());
             }
-            let overhead: u64 = 450 + files.iter().map(|f| Self::file_overhead(f)).sum::<u64>();
-            let run_cost = ((sum as f64 * crun + overhead as f64) * cpux) as u64;
+            let nt = real.len();
+            let overhead: u64 = 250 + files.iter().map(|f| Self::file_overhead(f)).sum::<u64>();
+            // prior that every candidate passes (surviving mutants are common on small sets)
+            let p0: f64 = if nt <= 3 { 0.55 } else if nt <= 10 { 0.5 } else if nt <= 30 { 0.4 } else { 0.3 };
+            let run_cost = ((sum as f64 * 1.2 * crun + overhead as f64 + (1.0 - p0) * 450.0) * cpux) as u64;
             let base = pack_cost(&self.tests, &forced);
             let mut all = forced.clone();
             all.extend(real.iter().copied());
             let inc = pack_cost(&self.tests, &all) - base;
-            if run_cost < inc {
-                log!("{}: run {} light tests (run {}ms < include {}ms)", p.commit, real.len(), run_cost, inc);
+            let gain = (p0 * inc as f64) as u64;
+            if run_cost < gain {
+                log!("{}: run {} light tests (run {}ms < expected gain {}ms of {}ms)", p.commit, nt, run_cost, gain, inc);
             } else {
-                log!("{}: include {} light tests unrun (run {}ms >= include {}ms)", p.commit, real.len(), run_cost, inc);
+                log!("{}: include {} light tests unrun (run {}ms >= expected gain {}ms of {}ms)", p.commit, nt, run_cost, gain, inc);
                 forced.extend(real.iter().copied());
                 real.clear();
             }
@@ -472,7 +623,7 @@ impl Ctx {
 
     fn plan(&self, commit: &str, text: &str) -> Plan {
         let fps = patch::parse(text);
-        let mut p = Plan { commit: commit.to_string(), static_change: false, adapters: Vec::new(), run: BTreeSet::new(), force: BTreeSet::new(), changed: vec![], ok: true };
+        let mut p = Plan { commit: commit.to_string(), code_hits: BTreeSet::new(), data_hits: BTreeSet::new(), static_change: false, adapters: Vec::new(), run: BTreeSet::new(), force: BTreeSet::new(), changed: vec![], ok: true };
         let mut seen_paths: HashSet<String> = HashSet::new();
         for fp in &fps {
             let oldp = fp.old_path.clone();
@@ -511,7 +662,15 @@ impl Ctx {
             }
             // Selection
             let path = oldp.clone().or(newp.clone()).unwrap_or_default();
+            let before = std::mem::take(&mut p.run);
             self.select_file(&mut p, &path, old_text.as_deref(), if newp.is_some() { new_text.as_deref() } else { None }, fp, oldp.is_none(), newp.is_none() || oldp != newp);
+            let got = std::mem::replace(&mut p.run, before);
+            if path.ends_with(".py") {
+                p.code_hits.extend(got.iter().copied());
+            } else {
+                p.data_hits.extend(got.iter().copied());
+            }
+            p.run.extend(got);
         }
         p
     }
@@ -581,6 +740,7 @@ impl Ctx {
         }
         let info = pyline::analyze(old);
         let t = patch::touches(&fp.hunks);
+        let stmt_ok = stmt_guard(&t, &info);
         let mut coarse = false;
         let mut sets: BTreeSet<u32> = BTreeSet::new();
         // statement set -> dict keys whose entries changed (string-keyed entries only)
@@ -616,7 +776,20 @@ impl Ctx {
                 sets.insert(s);
             }
             if let Some(u) = innermost(&fm.units, l) {
-                sets.insert(u.2);
+                // statement-level reach: tests that execute the changed statement
+                let h = if stmt_ok && std::env::var("BR_NOSTMT").is_err() {
+                    fm.hdrs.iter().copied().filter(|h| h.0 <= l && l <= h.1 && u.0 <= h.0 && h.1 <= u.1).min_by_key(|h| h.1 - h.0)
+                } else {
+                    None
+                };
+                match h {
+                    Some(h) => {
+                        sets.insert(h.2);
+                    }
+                    None => {
+                        sets.insert(u.2);
+                    }
+                }
             } else if let Some(x) = innermost(&fm.stmts, l) {
                 p.static_change = true;
                 match dict_key(&t.removed_text[t.removed.iter().position(|&r| r as u32 == l).unwrap()]) {
@@ -824,8 +997,11 @@ struct Outcome {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_job(r: &mut Runner, job: usize, root: &Path, base_timeout: f64, items: &[(f64, &str)], pre: &str, probes: &[(String, String)], adapts: &[(String, Vec<String>, usize)]) -> Option<Outcome> {
+fn run_job(r: &mut Runner, job: usize, root: &Path, base_timeout: f64, items: &[(f64, &str)], pre: &str, probes: &[(String, String)], adapts: &[(String, Vec<String>, usize)], stopfail: bool) -> Option<Outcome> {
     let mut s = format!("JOB {job} {} {base_timeout} {pre}\n", root.display());
+    if stopfail {
+        s.push_str("STOPFAIL\n");
+    }
     for (name, its, _) in adapts {
         s.push_str(&format!("ADAPT {name} {}\n", its.join(",")));
     }
@@ -923,7 +1099,7 @@ fn main() {
     let id2t_owned: HashMap<String, usize> = id2t.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     drop(id2t);
     let t2map: HashMap<usize, usize> = map2t.iter().enumerate().filter_map(|(m, t)| t.map(|t| (t, m))).collect();
-    let ctx = Ctx { src_root: src_root.clone(), tests, map, map2t, by_file, id2t: id2t_owned, t2map, texts: Mutex::new(HashMap::new()) };
+    let ctx = Ctx { src_root: src_root.clone(), tests, map, map2t, by_file, id2t: id2t_owned, t2map, texts: Mutex::new(HashMap::new()), norm_cache: Mutex::new(HashMap::new()), data_index: Mutex::new(None) };
 
     let mut commits: Vec<(String, PathBuf)> = Vec::new();
     if let Ok(rd) = fs::read_dir(data.join("commits")) {
@@ -951,7 +1127,7 @@ fn main() {
             Ok(p) => p,
             Err(_) => {
                 log!("{c}: planning panicked: including every test");
-                Plan { commit: c.clone(), static_change: true, adapters: vec![], run: BTreeSet::new(), force: (0..ctx.tests.len()).collect(), changed: vec![], ok: true }
+                Plan { commit: c.clone(), code_hits: BTreeSet::new(), data_hits: BTreeSet::new(), static_change: true, adapters: vec![], run: BTreeSet::new(), force: (0..ctx.tests.len()).collect(), changed: vec![], ok: true }
             }
         };
         // unmapped tests: always include when anything python changed (we know nothing about them)
@@ -992,9 +1168,17 @@ fn main() {
                 .filter(|(p, c)| c.is_some() && p.ends_with(".py") && (p.starts_with("sqlglot/") || p.starts_with("tests/")))
                 .map(|(p, _)| (modname(p), p.clone()))
                 .collect();
-            let tests: Vec<usize> = pl.run.iter().copied().collect();
+            let mut tests: Vec<usize> = pl.run.iter().copied().collect();
+            // short tests first: a failure shows up early
+            tests.sort_by_key(|&t| (ctx.tests[t].ms, t));
+            let small = tests.iter().map(|&t| ctx.tests[t].ms).sum::<u64>() < 4000;
             let first = jobs.len();
             chunk_into(&mut jobs, pi, &tests, &ctx.tests, chunk_ms, probes.clone());
+            if small {
+                for j in jobs[first..].iter_mut() {
+                    j.stopfail = true;
+                }
+            }
             if !pl.adapters.is_empty() {
                 let est: u64 = pl.adapters.iter().map(|a| a.3).sum();
                 let adapts: Vec<(String, Vec<String>, usize)> = pl.adapters.iter().map(|(n, its, t, _)| (n.clone(), its.clone(), *t)).collect();
@@ -1003,7 +1187,7 @@ fn main() {
                     jobs[first].adapts = adapts;
                     jobs[first].est += est;
                 } else {
-                    jobs.push(Job { plan: pi, tests: vec![], est, probes, adapts });
+                    jobs.push(Job { plan: pi, stopfail: false, tests: vec![], est, probes, adapts });
                 }
             }
             // nothing to run and only function bodies changed: a syntax check is enough
@@ -1050,12 +1234,7 @@ fn main() {
                 results.lock().unwrap()[pi].insert(t);
             }
             chunk_into(&mut jobs2, pi, &tests, &ctx.tests, 20000, vec![]);
-            // an import failure can also break the heavy tests we planned to check
-            for (_, _, t, _) in &plans[pi].adapters {
-                if !plans[pi].run.contains(t) {
-                    results.lock().unwrap()[pi].insert(*t);
-                }
-            }
+
         }
         if !jobs2.is_empty() {
             run_round(jobs2, nrun, &plans, &ctx, &results, &rs, &src_root, &tmp, &python, &app, t0, budget + 15.0);
@@ -1092,6 +1271,8 @@ fn main() {
 
 struct Job {
     plan: usize,
+    /// stop at the first failure: the rest is cheap to include unrun
+    stopfail: bool,
     tests: Vec<usize>,
     est: u64,
     probes: Vec<(String, String)>,
@@ -1110,7 +1291,7 @@ fn chunk_into(jobs: &mut Vec<Job>, pi: usize, tests: &[usize], all: &[Test], chu
     for &t in tests {
         let ms = all[t].ms + 2;
         if !cur.is_empty() && cur_ms + ms > chunk_ms {
-            jobs.push(Job { plan: pi, tests: std::mem::take(&mut cur), est: cur_ms, probes: probes.take().unwrap_or_default(), adapts: vec![] });
+            jobs.push(Job { plan: pi, stopfail: false, tests: std::mem::take(&mut cur), est: cur_ms, probes: probes.take().unwrap_or_default(), adapts: vec![] });
             cur_ms = 0;
         }
         cur.push(t);
@@ -1118,7 +1299,7 @@ fn chunk_into(jobs: &mut Vec<Job>, pi: usize, tests: &[usize], all: &[Test], chu
     }
     let p = probes.take().unwrap_or_default();
     if !cur.is_empty() || !p.is_empty() {
-        jobs.push(Job { plan: pi, tests: cur, est: cur_ms, probes: p, adapts: vec![] });
+        jobs.push(Job { plan: pi, stopfail: false, tests: cur, est: cur_ms, probes: p, adapts: vec![] });
     }
 }
 
@@ -1190,10 +1371,12 @@ fn run_round(
                             } else {
                                 "0".to_string()
                             };
-                            let tmo = if job.adapts.is_empty() { 20.0 } else { 20.0 + 3.0 * job.est as f64 / 1000.0 };
-                            if let Some(o) = run_job(r, job.plan, &farm, tmo, &items, &pre, &job.probes, &job.adapts) {
+                            // an adapter that runs far past its estimate is treated as failing: the heavy test is included
+                            let tmo = if job.adapts.is_empty() { 20.0 + 4.0 * job.est as f64 / 1000.0 } else { 5.0 + 3.0 * job.est as f64 / 1000.0 };
+                            if let Some(o) = run_job(r, job.plan, &farm, tmo, &items, &pre, &job.probes, &job.adapts, job.stopfail) {
                                 ok = true;
-                                for (name, _, t) in &job.adapts {
+                                // after an import failure the adapters were skipped: the importer round decides
+                                for (name, _, t) in job.adapts.iter().filter(|_| o.import_fail.is_empty()) {
                                     if !o.adapt_ok.contains(name) {
                                         log!("{}: adapter {name} failed -> include {}", pl.commit, ctx.tests[*t].id);
                                         fails.insert(*t);

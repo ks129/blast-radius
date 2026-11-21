@@ -465,6 +465,40 @@ for (path, s, e), k in sorted(seen_units.items()):
                 st |= class_users(cls)
     file_sections[path].append(f"U {s} {e} {sid(st)}")
 
+# statement headers inside function bodies (statement-level reach)
+def _stmt_headers(body, out):
+    for st in body:
+        if not isinstance(st, ast.stmt):
+            continue
+        sub = [getattr(st, f, None) for f in ("body", "orelse", "finalbody")]
+        sub = [b for b in sub if isinstance(b, list) and b]
+        handlers = getattr(st, "handlers", None) or []
+        cases = getattr(st, "cases", None) or []
+        if sub or handlers or cases:
+            first_child = min([b[0].lineno for b in sub] + [h.lineno for h in handlers] + [c.pattern.lineno for c in cases])
+            end = max(st.lineno, first_child - 1)
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue  # nested definitions are units of their own
+            out.append((st.lineno, end))
+            for b in sub:
+                _stmt_headers(b, out)
+            for h in handlers:
+                _stmt_headers(h.body, out)
+            for c in cases:
+                _stmt_headers(c.body, out)
+        else:
+            out.append((st.lineno, st.end_lineno))
+
+
+for (path, s_, e_), k in sorted(seen_units.items()):
+    node = func_units[k][1]
+    if isinstance(node, ast.Lambda):
+        continue
+    hs = []
+    _stmt_headers(node.body, hs)
+    for a, b in hs:
+        file_sections[path].append(f"H {a} {b} {sid(runtime_lines(path, a, b))}")
+
 # classes: header + body ranges
 for path, node, cn, outer in class_defs:
     cu = class_users(cn) | chain_refs(cn, {node.name}) | name_closure({node.name})

@@ -17,6 +17,12 @@ for name in dict.fromkeys(r["id"].split("::")[1] for r in recs):
     adapters.setup(name)
     cpu[f"ADAPT::{name}::base"] = time.process_time() - c0
     for it in adapters.items(name):
+        # cost with a cold table cache: lazily loaded tables are part of an item's price
+        if name.startswith("exec") or name == "opt_tpch":
+            inst = adapters._exec["inst"]
+            for tb in (inst.tpch_tables, inst.tpcds_tables):
+                dict.clear(tb)
+            adapters._exec["init"] = None
         c0 = time.process_time()
         try:
             adapters.run_item(name, it)
