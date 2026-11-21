@@ -507,7 +507,7 @@ impl Ctx {
 
     fn file_overhead(file: &str) -> u64 {
         match file {
-            "tests/test_executor.py" => 700,
+            "tests/test_executor.py" => 250,
             "tests/test_optimizer.py" => 30,
             _ => 10,
         }
@@ -577,7 +577,7 @@ impl Ctx {
                 exhaustive = true;
             }
             let setup: u64 = if name.starts_with("exec") || name.starts_with("opt") {
-                1200
+                450
             } else if name.starts_with("fx_") {
                 // optimizer class set-up plus the test's non-fixture part
                 let base_id = format!("ADAPT::{name}::base");
@@ -589,6 +589,10 @@ impl Ctx {
             let limit = 0.6 * (d + 2000) as f64 / cpux;
             if base_hit {
                 log!("{}: include {} (setup reached)", p.commit, name);
+                forced.insert(t);
+            } else if hits.is_empty() && name.starts_with("fx_") {
+                // fixture-adapter records do not cover the class set-up: stay safe
+                log!("{}: include {} (reached outside its items)", p.commit, name);
                 forced.insert(t);
             } else if hits.is_empty() {
                 // neither the setup nor any item can see the change
@@ -1038,8 +1042,12 @@ struct Runner {
     stdout: BufReader<ChildStdout>,
 }
 
+static HEAVY_PRELOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn spawn_runner(python: &str, script: &Path, src_root: &Path) -> Option<Runner> {
+    let heavy = if HEAVY_PRELOAD.load(std::sync::atomic::Ordering::Relaxed) { "1" } else { "0" };
     let mut child = Command::new(python)
+        .env("BR_HEAVY_PRELOAD", heavy)
         .arg(script)
         .current_dir(src_root)
         .stdin(Stdio::piped())
@@ -1265,6 +1273,12 @@ fn main() {
                 }
             }
         }
+        // preload pandas/duckdb in the runner only if some job will import them
+        let needs_heavy = jobs.iter().any(|j| {
+            !j.adapts.is_empty()
+                || j.tests.iter().any(|&t| matches!(ctx.tests[t].file.as_str(), "tests/test_executor.py" | "tests/test_optimizer.py"))
+        });
+        HEAVY_PRELOAD.store(needs_heavy, std::sync::atomic::Ordering::Relaxed);
         let total_est: u64 = jobs.iter().map(|j| j.est + 450).sum();
         let nrun = if total_est < 40_000 { 1 } else { nrun };
         log!("estimated work {}ms -> {} runner(s)", total_est, nrun);

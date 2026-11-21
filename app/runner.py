@@ -29,11 +29,13 @@ import _pytest.unittest  # noqa: E402,F401
 import _pytest.python  # noqa: E402,F401
 import _pytest.subtests  # noqa: E402,F401
 
-for _m in ("duckdb", "pandas", "pandas.testing", "numpy", "dateutil", "pytz"):
-    try:
-        __import__(_m)
-    except Exception:
-        pass
+# pandas/numpy/duckdb cost ~0.35 s to import: only preload them when some job needs them
+if os.environ.get("BR_HEAVY_PRELOAD", "1") == "1":
+    for _m in ("duckdb", "pandas", "pandas.testing", "numpy", "dateutil", "pytz"):
+        try:
+            __import__(_m)
+        except Exception:
+            pass
 
 PRELOAD = ("sqlglot", "sqlglot.optimizer", "sqlglot.executor", "sqlglot.planner", "sqlglot.serde",
            "sqlglot.diff", "sqlglot.lineage", "sqlglot.schema", "sqlglot.dialects.dialect")
@@ -48,6 +50,14 @@ if os.environ.get("BR_PRELOAD", "1") == "1":
         _pre_ok = False
     finally:
         sys.path.pop(0)
+
+import gc  # noqa: E402
+
+# Preloaded modules never die: keep them out of every collection in the children.
+_GC = os.environ.get("BR_GC", "freeze")
+if "freeze" in _GC:
+    gc.collect()
+    gc.freeze()
 
 OUT = sys.stdout
 sys.stdout = sys.stderr
@@ -174,6 +184,9 @@ def selective_purge(root, changed):
 
 def child(root, ids, wfd, pre, probes=(), adapts=()):
     try:
+        if "thr" in _GC:
+            # sqlglot trees are full of parent<->child cycles: collect less often
+            gc.set_threshold(50_000, 20, 20)
         if not (pre == "1" and _pre_ok):
             done = False
             changed = pre[2:].split(",") if pre.startswith("S:") else None

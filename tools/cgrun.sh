@@ -2,12 +2,12 @@
 # usage: cgrun.sh <data-dir> [answers] -- run selector in its own cgroup scope, report total CPU like the scorer
 DATA=${1:-$HOME/starter/sample}
 ANS=${2:-$DATA/answers.json}
-export BR_DATA=$DATA BR_APP=$HOME/sub/app BR_SRC=$HOME/sqlglot BR_TMP=/tmp/blast_$$ BR_PYTHON=$HOME/venv/bin/python
+export BR_DATA=$DATA BR_APP=${APPDIR:-$HOME/sub/app} BR_SRC=$HOME/sqlglot BR_TMP=/tmp/blast_$$ BR_PYTHON=$HOME/venv/bin/python
 export PATH=$HOME/venv/bin:$PATH SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1 HOME_OUT=$HOME
 mkdir -p $BR_TMP
 systemd-run --user --scope -q -p AllowedCPUs=${CORES:-6,7} bash -c '
   CG=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
-  /usr/bin/time -o /tmp/time_'$$' -f "%U %S %e" $HOME_OUT/sub/selector/target/release/selector > /tmp/out_'$$'.jsonl 2> /tmp/err_'$$'.log
+  /usr/bin/time -o /tmp/time_'$$' -f "%U %S %e" ${SELBIN:-$HOME_OUT/sub/selector/target/release/selector} > /tmp/out_'$$'.jsonl 2> /tmp/err_'$$'.log
   sleep 1
   echo "leftover procs: $(cat $CG/cgroup.procs | wc -l)"
   grep usage_usec $CG/cpu.stat

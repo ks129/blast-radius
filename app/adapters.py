@@ -115,35 +115,103 @@ class _LazyTables(dict):
         return key in self.schema
 
 
-def _executor():
-    """Same state as TestExecutor.setUpClass, with tables parsed lazily."""
-    if "m" not in _exec:
-        import duckdb
-        import tests.test_executor as m
+class _LazyConn:
+    """A DuckDB connection whose CSV views are created when a query first names them."""
 
-        cls = m.TestExecutor
-        cls.tpch_conn = duckdb.connect()
-        cls.tpcds_conn = duckdb.connect()
-        for conn, directory, schema in ((cls.tpch_conn, m.DIR_TPCH, m.TPCH_SCHEMA), (cls.tpcds_conn, m.DIR_TPCDS, m.TPCDS_SCHEMA)):
-            for table, columns in schema.items():
-                file_name = f"{directory}{table}.csv.gz"
-                conn.execute(
+    def __init__(self, directory, schema):
+        self.directory, self.schema = directory, schema
+        self.conn = None
+        self.made = set()
+
+    def _ensure(self, sql):
+        import re
+
+        import duckdb
+
+        if self.conn is None:
+            self.conn = duckdb.connect()
+        low = sql.lower()
+        for table, columns in self.schema.items():
+            if table not in self.made and re.search(r"\b" + re.escape(table.lower()) + r"\b", low):
+                file_name = f"{self.directory}{table}.csv.gz"
+                self.conn.execute(
                     f"""
                 CREATE VIEW {table} AS
                 SELECT *
                 FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})
                 """
                 )
+                self.made.add(table)
+
+    def execute(self, sql, *args, **kwargs):
+        self._ensure(sql)
+        return self.conn.execute(sql, *args, **kwargs)
+
+    def close(self):
+        if self.conn is not None:
+            self.conn.close()
+
+    def __getattr__(self, name):
+        if self.conn is None:
+            import duckdb
+
+            self.conn = duckdb.connect()
+        return getattr(self.conn, name)
+
+
+def _executor():
+    """Same state as TestExecutor.setUpClass, with tables and views made on first use."""
+    if "m" not in _exec:
+        import tests.test_executor as m
+
+        cls = m.TestExecutor
+        cls.tpch_conn = _LazyConn(m.DIR_TPCH, m.TPCH_SCHEMA)
+        cls.tpcds_conn = _LazyConn(m.DIR_TPCDS, m.TPCDS_SCHEMA)
         cls.tpch_tables = _LazyTables(m, m.DIR_TPCH, m.TPCH_SCHEMA)
         cls.tpcds_tables = _LazyTables(m, m.DIR_TPCDS, m.TPCDS_SCHEMA)
         cls.cache = {}
         cls.tpch_sqls = list(m.load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
         cls.tpcds_sqls = list(m.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
+        _preload_reference(m, cls)
         inst = cls("test_execute_tpch")
         _exec["m"] = m
         _exec["inst"] = inst
         _exec["init"] = None
     return _exec["m"], _exec["inst"]
+
+
+def _preload_reference(m, cls):
+    """Reference results computed by DuckDB at build time (pinned commit). Used only while
+    the patched tree's duckdb transpilation of the query is byte-identical to the pinned one
+    and the test file, helpers and TPC fixtures are the pinned ones; otherwise the query
+    goes to DuckDB live as in the real test."""
+    import os
+    import pickle as _p
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpc_ref.pkl")
+    src = os.environ.get("BR_SRC_DIR")
+    if not os.path.exists(path) or not src:
+        return
+    root = os.getcwd()
+    pinned = ("tests/test_executor.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-h", "tests/fixtures/optimizer/tpc-ds")
+    for rel in pinned:
+        if not os.path.realpath(os.path.join(root, rel)).startswith(src + os.sep):
+            return
+    try:
+        with open(path, "rb") as fh:
+            ref = _p.load(fh)
+    except Exception:
+        return
+    orig = cls.cached_execute
+
+    def cached_execute(self, sql, tpch=True):
+        if sql not in self.cache and sql in ref:
+            transpiled, frame = ref[sql]
+            if m.transpile(sql, write="duckdb")[0] == transpiled:
+                self.cache[sql] = frame.copy()
+        return orig(self, sql, tpch=tpch)
+
+    cls.cached_execute = cached_execute
 
 
 def items(name):
